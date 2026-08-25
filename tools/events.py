@@ -9,17 +9,18 @@ def events_in_window(
     end_col="end",
 ):
     """
-    Retourne les événements qui chevauchent la fenêtre temporelle.
+    Sélectionne les événements qui chevauchent la fenêtre temporelle.
 
-    Un événement est retenu s'il commence avant la fin de la fenêtre
-    ET se termine après le début de la fenêtre.
+    Un événement est conservé si :
 
-    Exemple :
-        fenêtre : [1000, 2000]
-        fixation : [900, 1200]
+        event_end >= window_start
+        ET
+        event_start <= window_end
 
-    Cette fixation est retenue car elle chevauche la fenêtre.
+    Cela inclut par exemple une fixation ayant commencé juste avant
+    le début de la fenêtre mais se poursuivant dans cette fenêtre.
     """
+
     if df is None or len(df) == 0:
         return pd.DataFrame()
 
@@ -28,10 +29,10 @@ def events_in_window(
     if not required_columns.issubset(df.columns):
         return pd.DataFrame()
 
-    overlap_mask = (
+    overlap = (
         (df[end_col] >= t_start)
         &
         (df[start_col] <= t_end)
     )
 
-    return df.loc[overlap_mask].copy()
+    return df.loc[overlap].copy()

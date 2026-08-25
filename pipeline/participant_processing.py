@@ -1,7 +1,13 @@
+import traceback
+
+import numpy as np
 import pandas as pd
 
-from tools.behavior import parse_behavioral, get_trials_for_run
 from pipeline.run_processing import process_one_run
+from tools.behavior import (
+    get_trials_for_run,
+    parse_behavioral,
+)
 
 
 def process_participant(
@@ -11,78 +17,183 @@ def process_participant(
     analysis_windows,
     verbose=True,
 ):
+    """
+    Traite tous les runs disponibles pour un participant.
+    """
+
+    print("\n" + "#" * 70)
+    print(f"# PARTICIPANT : {participant_id}")
+    print(
+        f"# Runs : "
+        f"{list(participant_info['runs'].keys())}"
+    )
+    print("#" * 70)
+
+    data_dir = participant_info["data_dir"]
+
     run_results = {}
 
-    h1_all = []
-    h2_all = []
-    h3_all = []
-    h4_all = []
+    all_h1 = []
+    all_h2 = []
+    all_h3 = []
+    all_h4 = []
 
-    for run_id, run_info in sorted(participant_info["runs"].items()):
+    qc_rows = []
 
-        if run_id not in participant_info["csv_per_run"]:
-            print(f"⚠ CSV manquant : {participant_id}, run {run_id}")
+    for run_id, run_info in sorted(
+        participant_info["runs"].items()
+    ):
+        asc_path = data_dir / run_info["asc"]
+
+        section_id = run_info.get(
+            "section_id",
+            None,
+        )
+
+        if not asc_path.exists():
+            print(
+                f"  ⚠ ASC absent : {asc_path} "
+                "→ run ignoré."
+            )
             continue
 
-        asc_path = participant_info["data_dir"] / run_info["asc"]
+        if run_id not in participant_info.get(
+            "csv_per_run",
+            {},
+        ):
+            print(
+                f"  ⚠ CSV comportemental absent : "
+                f"{participant_id}, run {run_id}"
+            )
+            continue
+
         csv_path = (
-            participant_info["data_dir"]
-            / participant_info["csv_per_run"][run_id]
+            data_dir
+            /
+            participant_info["csv_per_run"][run_id]
         )
 
-        behavior = parse_behavioral(csv_path)
+        try:
+            behavior_df = parse_behavioral(csv_path)
 
-        trials, t0_fmri = get_trials_for_run(
-            behavior,
-            participant_id=participant_id,
-            run_id=run_id,
-            section_id=run_info.get("section_id"),
+            trials_df, t0_fmri = get_trials_for_run(
+                behav_all=behavior_df,
+                participant_id=participant_id,
+                run_id=run_id,
+                section_id=section_id,
+            )
+
+            if trials_df.empty:
+                print(
+                    f"  ⚠ Aucun essai : "
+                    f"{participant_id}, run {run_id}"
+                )
+                continue
+
+            if not np.isfinite(t0_fmri):
+                print(
+                    f"  ⚠ t0_fMRI introuvable : "
+                    f"{participant_id}, run {run_id}"
+                )
+                continue
+
+            print(
+                f"\n  Run {run_id} : "
+                f"{len(trials_df)} essais | "
+                f"t0_fMRI = {t0_fmri:.3f} s"
+            )
+
+            run_result = process_one_run(
+                participant_id=participant_id,
+                run_id=run_id,
+                asc_path=asc_path,
+                trials_df=trials_df,
+                t0_fmri_behav=t0_fmri,
+                params=params,
+                analysis_windows=analysis_windows,
+                verbose=verbose,
+            )
+
+            run_results[run_id] = run_result
+
+            if run_result["qc"] is not None:
+                qc_rows.append(run_result["qc"])
+
+            if len(run_result["h1"]):
+                all_h1.append(run_result["h1"])
+
+            if len(run_result["h2"]):
+                all_h2.append(run_result["h2"])
+
+            if len(run_result["h3"]):
+                all_h3.append(run_result["h3"])
+
+            if len(run_result["h4"]):
+                all_h4.append(run_result["h4"])
+
+        except Exception as error:
+            print(
+                f"  ✗ ERREUR : "
+                f"{participant_id}, run {run_id}"
+            )
+            print(f"    {error}")
+            traceback.print_exc()
+
+    concat = {
+        "h1": (
+            pd.concat(all_h1, ignore_index=True)
+            if all_h1
+            else pd.DataFrame()
+        ),
+
+        "h2": (
+            pd.concat(all_h2, ignore_index=True)
+            if all_h2
+            else pd.DataFrame()
+        ),
+
+        "h3": (
+            pd.concat(all_h3, ignore_index=True)
+            if all_h3
+            else pd.DataFrame()
+        ),
+
+        "h4": (
+            pd.concat(all_h4, ignore_index=True)
+            if all_h4
+            else pd.DataFrame()
+        ),
+    }
+
+    qc_df = (
+        pd.DataFrame(qc_rows)
+        if qc_rows
+        else pd.DataFrame()
+    )
+
+    print("\n" + "=" * 60)
+    print(f"BILAN {participant_id}")
+    print("=" * 60)
+
+    for hypothesis in ["h1", "h2", "h3", "h4"]:
+        df = concat[hypothesis]
+
+        n_trials = len(df)
+
+        n_runs = (
+            df["run_id"].nunique()
+            if n_trials and "run_id" in df.columns
+            else 0
         )
 
-        if trials.empty:
-            print(f"⚠ Aucun essai : {participant_id}, run {run_id}")
-            continue
-
-        if pd.isna(t0_fmri):
-            print(f"⚠ t0 fMRI absent : {participant_id}, run {run_id}")
-            continue
-
-        result = process_one_run(
-            participant_id=participant_id,
-            run_id=run_id,
-            asc_path=asc_path,
-            trials_df=trials,
-            t0_fmri_behav=t0_fmri,
-            params=params,
-            analysis_windows=analysis_windows,
-            verbose=verbose,
+        print(
+            f"  {hypothesis.upper()} : "
+            f"{n_trials} essais sur {n_runs} runs"
         )
-
-        run_results[run_id] = result
-
-        for hypothesis, target in [
-            ("h1", h1_all),
-            ("h2", h2_all),
-            ("h3", h3_all),
-            ("h4", h4_all),
-        ]:
-            if len(result[hypothesis]):
-                target.append(result[hypothesis])
 
     return {
         "participant": participant_id,
         "run_results": run_results,
-        "concat": {
-            "h1": pd.concat(h1_all, ignore_index=True)
-            if h1_all else pd.DataFrame(),
-
-            "h2": pd.concat(h2_all, ignore_index=True)
-            if h2_all else pd.DataFrame(),
-
-            "h3": pd.concat(h3_all, ignore_index=True)
-            if h3_all else pd.DataFrame(),
-
-            "h4": pd.concat(h4_all, ignore_index=True)
-            if h4_all else pd.DataFrame(),
-        },
+        "concat": concat,
+        "qc": qc_df,
     }

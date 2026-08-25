@@ -4,5 +4,8 @@
 # Ignorer les dossiers __pycache__ (Python)
 __pycache__/
 
-# Ignorer tout le contenu du dossier output/
+# Ignorer tout le contenu du dossier data/
 data/
+
+# Ignorer tout le contenu du dossier results/
+results/

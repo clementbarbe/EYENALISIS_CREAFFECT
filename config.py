@@ -38,6 +38,8 @@ PARAMS = {
     "blink_margin_ms": 100,
 
     "min_pupil": 100,
+
+    # Recommandé plutôt que 2.0 :
     "mad_threshold": 3.0,
 
     "pupil_lowpass_cutoff": 4.0,
@@ -69,10 +71,6 @@ PARAMS = {
 }
 
 
-# ─────────────────────────────────────────────────────────────
-# FENÊTRES D'ANALYSE
-# ─────────────────────────────────────────────────────────────
-
 ANALYSIS_WINDOWS = {
     "h1": {
         "main": 10.0,
@@ -96,8 +94,6 @@ ANALYSIS_WINDOWS = {
         "include_full_ideation": True,
     },
 }
-
-
 # ─────────────────────────────────────────────────────────────
 # CRITÈRES QC GROUPE
 # ─────────────────────────────────────────────────────────────

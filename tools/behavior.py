@@ -4,7 +4,13 @@ import pandas as pd
 
 def parse_behavioral(filepath):
     """
-    Lecture robuste de fichiers comportementaux CSV, TSV ou semi-colon.
+    Lecture robuste d'un fichier comportemental.
+
+    Accepte :
+    - CSV virgule
+    - CSV point-virgule
+    - TSV
+    - format texte clé: valeur
     """
 
     for sep in [",", ";", "\t"]:
@@ -12,7 +18,10 @@ def parse_behavioral(filepath):
             df = pd.read_csv(filepath, sep=sep)
 
             if len(df.columns) > 1:
-                df.columns = [str(col).strip() for col in df.columns]
+                df.columns = [
+                    str(column).strip()
+                    for column in df.columns
+                ]
                 return df
 
         except Exception:
@@ -66,8 +75,9 @@ def _strict_filter(df, mask, label):
     """
     Filtrage strict.
 
-    Si aucune ligne ne correspond, retourne un dataframe vide.
-    Cela évite de conserver silencieusement les données de tous les runs.
+    Si aucune ligne n'est trouvée, retourne un dataframe vide.
+    Cela empêche d'analyser involontairement les données d'un autre
+    participant ou d'un autre run.
     """
     filtered = df.loc[mask].copy()
 
@@ -84,25 +94,33 @@ def get_trials_for_run(
     section_id=None,
 ):
     """
-    Extrait les essais comportementaux correspondant à un participant et run.
+    Extrait les essais d'un participant et d'un run.
 
-    Retourne :
-        trials : dataframe des essais
-        t0     : t0 fMRI du run, ou NaN
+    Retourne
+    --------
+    trials : pd.DataFrame
+        Essais valides du run.
+
+    t0 : float
+        Temps t0_fMRI en secondes, ou np.nan si introuvable.
     """
 
     if behav_all is None or len(behav_all) == 0:
         return pd.DataFrame(), np.nan
 
     df = behav_all.copy()
-    df.columns = [str(column).strip() for column in df.columns]
+
+    df.columns = [
+        str(column).strip()
+        for column in df.columns
+    ]
 
     # ─────────────────────────────────────────────────────────
-    # PARTICIPANT
+    # Participant
     # ─────────────────────────────────────────────────────────
 
     if "participant" in df.columns:
-        participant_series = (
+        participant_values = (
             df["participant"]
             .astype(str)
             .str.strip()
@@ -110,7 +128,7 @@ def get_trials_for_run(
 
         df = _strict_filter(
             df,
-            participant_series == str(participant_id),
+            participant_values == str(participant_id),
             label=f"participant={participant_id}",
         )
 
@@ -118,7 +136,7 @@ def get_trials_for_run(
             return pd.DataFrame(), np.nan
 
     # ─────────────────────────────────────────────────────────
-    # RUN
+    # Run
     # ─────────────────────────────────────────────────────────
 
     if "run_id" in df.columns:
@@ -137,7 +155,7 @@ def get_trials_for_run(
             return pd.DataFrame(), np.nan
 
     # ─────────────────────────────────────────────────────────
-    # SECTION
+    # Section
     # ─────────────────────────────────────────────────────────
 
     if section_id is not None and "section_id" in df.columns:
@@ -156,7 +174,7 @@ def get_trials_for_run(
             return pd.DataFrame(), np.nan
 
     # ─────────────────────────────────────────────────────────
-    # LIGNES TIMING
+    # Ligne TIMING
     # ─────────────────────────────────────────────────────────
 
     if "task" in df.columns:
@@ -190,6 +208,7 @@ def get_trials_for_run(
         if len(values):
             t0 = float(values.iloc[0])
 
+    # Fallback : chercher dans l'ensemble du fichier du run.
     if not np.isfinite(t0) and "t0_fMRI" in df.columns:
         values = pd.to_numeric(
             df["t0_fMRI"],
@@ -200,7 +219,7 @@ def get_trials_for_run(
             t0 = float(values.iloc[0])
 
     # ─────────────────────────────────────────────────────────
-    # ESSAIS
+    # Essais
     # ─────────────────────────────────────────────────────────
 
     if "trial_n" in df.columns:
@@ -223,7 +242,7 @@ def get_trials_for_run(
     trials.reset_index(drop=True, inplace=True)
 
     # ─────────────────────────────────────────────────────────
-    # CATÉGORIES
+    # Nettoyage catégories
     # ─────────────────────────────────────────────────────────
 
     if "stim_category" in trials.columns:
