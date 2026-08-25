@@ -77,11 +77,15 @@ def process_participant(
             behavior_df = parse_behavioral(csv_path)
 
             trials_df, t0_fmri = get_trials_for_run(
-                behav_all=behavior_df,
-                participant_id=participant_id,
-                run_id=run_id,
-                section_id=section_id,
-            )
+            behav_all=behavior_df,
+            participant_id=participant_id,
+            run_id=run_id,
+            section_id=section_id,
+
+            # Important : chaque CSV est déjà un fichier
+            # spécifique à un sujet et à un run.
+            already_one_run_file=True,
+)
 
             if trials_df.empty:
                 print(

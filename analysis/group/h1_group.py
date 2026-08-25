@@ -1,28 +1,51 @@
 import pandas as pd
-import matplotlib.pyplot as plt
 
 from config import (
-    PARAMS,
-    GROUP_DIR,
     H1_METRICS,
+    PARAMS,
 )
-from tools.statistics import paired_friedman, pairwise_wilcoxon
+
+from tools.statistics import (
+    paired_friedman,
+    pairwise_wilcoxon,
+)
+
 from analysis.group.common import (
+    apply_group_qc,
+    get_group_output_dir,
     load_group_data,
     load_qc,
-    apply_group_qc,
+    plot_condition_boxplot,
+    print_condition_availability,
     subject_condition_table,
 )
 
 
 def analyse_group_h1(metric="pup_mean"):
+    """
+    H1 — Induction émotionnelle.
+
+    Compare les catégories émotionnelles avec :
+    - Friedman apparié ;
+    - Wilcoxon post-hoc avec FDR ;
+    - boxplot + points individuels au niveau sujet.
+    """
+
     if metric not in H1_METRICS:
-        print(f"⚠ Métrique non listée dans H1_METRICS : {metric}")
+        print(
+            f"⚠ {metric} n'est pas dans H1_METRICS, "
+            "mais l'analyse est tout de même lancée."
+        )
+
+    output_dir = get_group_output_dir("h1")
 
     df = load_group_data("h1")
-    qc = load_qc()
+    qc_df = load_qc()
 
-    df = apply_group_qc(df, qc)
+    df = apply_group_qc(
+        df,
+        qc_df,
+    )
 
     categories = PARAMS["emotion_categories"]
 
@@ -31,19 +54,26 @@ def analyse_group_h1(metric="pup_mean"):
     ].copy()
 
     if metric not in df.columns:
-        raise ValueError(f"Métrique absente : {metric}")
+        raise ValueError(
+            f"Métrique absente du fichier H1 : {metric}"
+        )
 
     subject_table = subject_condition_table(
         df,
         metric=metric,
+    ).reindex(columns=categories)
+
+    print_condition_availability(
+        subject_table,
+        categories,
     )
 
-    subject_table = subject_table.reindex(columns=categories)
-
-    stat, pvalue, n = paired_friedman(
-        subject_table=subject_table,
-        categories=categories,
-        value_col=metric,
+    friedman_stat, friedman_p, n_subjects = (
+        paired_friedman(
+            subject_table=subject_table,
+            categories=categories,
+            value_col=metric,
+        )
     )
 
     posthoc = pairwise_wilcoxon(
@@ -55,12 +85,13 @@ def analyse_group_h1(metric="pup_mean"):
     print("H1 — ANALYSE DE GROUPE")
     print("=" * 60)
     print(f"Métrique : {metric}")
-    print(f"Sujets complets dans Friedman : {n}")
-    print(f"Friedman χ² = {stat:.4f}")
-    print(f"p = {pvalue:.6f}")
+    print(f"Sujets complets dans Friedman : {n_subjects}")
+    print(f"Friedman χ² = {friedman_stat:.4f}")
+    print(f"p = {friedman_p:.6f}")
 
-    output_dir = GROUP_DIR / "h1"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # ─────────────────────────────────────────────────────────
+    # Exports tableaux
+    # ─────────────────────────────────────────────────────────
 
     subject_table.to_csv(
         output_dir / f"h1_{metric}_subject_table.csv"
@@ -73,68 +104,45 @@ def analyse_group_h1(metric="pup_mean"):
 
     pd.DataFrame([{
         "metric": metric,
-        "friedman_stat": stat,
-        "friedman_p": pvalue,
-        "n_subjects": n,
+        "friedman_stat": friedman_stat,
+        "friedman_p": friedman_p,
+        "n_complete_subjects": n_subjects,
     }]).to_csv(
         output_dir / f"h1_{metric}_friedman.csv",
         index=False,
     )
 
-    plot_h1_group(
-        subject_table,
-        metric,
-        output_dir,
+    # ─────────────────────────────────────────────────────────
+    # Figure
+    # ─────────────────────────────────────────────────────────
+
+    colors = [
+        PARAMS["emotion_colors"].get(
+            category,
+            "#95a5a6",
+        )
+        for category in categories
+    ]
+
+    plot_condition_boxplot(
+        subject_table=subject_table,
+        categories=categories,
+        metric=metric,
+        title=(
+            "H1 — Induction émotionnelle\n"
+            f"{metric} par catégorie"
+        ),
+        output_path=(
+            output_dir
+            / f"h1_{metric}_boxplot.png"
+        ),
+        colors=colors,
     )
 
     return {
+        "data": df,
         "subject_table": subject_table,
-        "friedman_stat": stat,
-        "friedman_p": pvalue,
+        "friedman_stat": friedman_stat,
+        "friedman_p": friedman_p,
         "posthoc": posthoc,
     }
-
-
-def plot_h1_group(subject_table, metric, output_dir):
-    categories = PARAMS["emotion_categories"]
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    for _, row in subject_table.iterrows():
-        ax.plot(
-            categories,
-            row.reindex(categories),
-            color="gray",
-            alpha=0.45,
-            marker="o",
-        )
-
-    means = subject_table[categories].mean()
-    sems = subject_table[categories].sem()
-
-    ax.errorbar(
-        categories,
-        means,
-        yerr=sems,
-        color="black",
-        linewidth=3,
-        marker="o",
-        markersize=8,
-        capsize=5,
-        label="Moyenne ± SEM",
-    )
-
-    ax.set_title(f"H1 groupe — {metric}")
-    ax.set_xlabel("Catégorie émotionnelle")
-    ax.set_ylabel(metric)
-    ax.grid(alpha=0.25)
-    ax.legend()
-
-    fig.tight_layout()
-
-    fig.savefig(
-        output_dir / f"h1_{metric}_group.png",
-        dpi=150,
-    )
-
-    plt.show()

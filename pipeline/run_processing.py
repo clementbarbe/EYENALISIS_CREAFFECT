@@ -204,7 +204,12 @@ def process_one_run(
     result["qc"] = {
         "participant": participant_id,
         "run_id": run_id,
+
+        # Durée réelle du run en secondes.
+        "duration_s": float(duration_s),
+
         "pct_pupil_valid": float(pct_pupil_valid),
+
         **blink_qc,
         **loss_qc,
         **pupil_qc,

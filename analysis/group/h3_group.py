@@ -1,17 +1,19 @@
 import pandas as pd
-import matplotlib.pyplot as plt
 
-from config import GROUP_DIR, H3_METRICS
+from config import H3_METRICS
+
 from tools.statistics import (
-    within_subject_correlations,
     group_test_fisher_correlations,
+    within_subject_correlations,
 )
 
-
 from analysis.group.common import (
+    apply_group_qc,
+    get_group_output_dir,
     load_group_data,
     load_qc,
-    apply_group_qc,
+    plot_correlation_forest,
+    plot_subject_faceted_scatter,
 )
 
 
@@ -20,22 +22,31 @@ def analyse_group_h3(
     correlation_method="spearman",
 ):
     """
-    H3 — Relation entre métrique pupillaire et rating.
+    H3 — Évaluation de l'idée.
 
-    Une corrélation est calculée séparément pour chaque participant.
-    Les r sont ensuite agrégés avec la transformation de Fisher.
+    Analyse principale :
+    relation intra-sujet entre une métrique pupillaire et le rating.
+
+    Figures :
+    - scatterplot pupille × rating facetté par sujet ;
+    - forest plot des corrélations intra-sujets.
     """
 
     if metric not in H3_METRICS:
         print(
             f"⚠ {metric} n'est pas dans H3_METRICS, "
-            "mais l'analyse est tentée."
+            "mais l'analyse est tout de même lancée."
         )
 
-    df = load_group_data("h3")
-    qc = load_qc()
+    output_dir = get_group_output_dir("h3")
 
-    df = apply_group_qc(df, qc)
+    df = load_group_data("h3")
+    qc_df = load_qc()
+
+    df = apply_group_qc(
+        df,
+        qc_df,
+    )
 
     if metric not in df.columns:
         raise ValueError(
@@ -44,16 +55,13 @@ def analyse_group_h3(
 
     if "rating" not in df.columns:
         raise ValueError(
-            "La colonne rating est absente du fichier H3."
+            "Colonne rating absente du fichier H3."
         )
-
-    output_dir = GROUP_DIR / "h3"
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     correlations = within_subject_correlations(
         df=df,
-        x_col=metric,
-        y_col="rating",
+        x_col="rating",
+        y_col=metric,
         method=correlation_method,
     )
 
@@ -62,57 +70,62 @@ def analyse_group_h3(
     )
 
     print("\n" + "=" * 60)
-    print("H3 — ANALYSE DE GROUPE")
+    print("H3 — GROUPE : PUPILLE × RATING")
     print("=" * 60)
     print(f"Métrique : {metric}")
     print(f"Méthode : {correlation_method}")
-    print(
-        f"r moyen = {group_result['mean_r']:.3f}, "
-        f"t = {group_result['t']:.3f}, "
-        f"p = {group_result['p']:.5f}, "
-        f"n = {group_result['n']}"
-    )
+    print(f"Sujets avec corrélation : {group_result['n']}")
+    print(f"r moyen : {group_result['mean_r']:.4f}")
+    print(f"t : {group_result['t']:.4f}")
+    print(f"p : {group_result['p']:.6f}")
 
     correlations.to_csv(
-        output_dir / f"h3_{metric}_rating_subject_correlations.csv",
+        output_dir
+        / f"h3_{metric}_rating_subject_correlations.csv",
         index=False,
     )
 
     pd.DataFrame([group_result]).to_csv(
-        output_dir / f"h3_{metric}_rating_group_test.csv",
+        output_dir
+        / f"h3_{metric}_rating_group_test.csv",
         index=False,
     )
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    ax.axhline(0, color="black", linewidth=1)
-
-    ax.bar(
-        correlations["participant"],
-        correlations["r"],
-        color="darkred",
-        alpha=0.75,
+    # Scatter facetté par sujet.
+    plot_subject_faceted_scatter(
+        df=df,
+        x_col="rating",
+        y_col=metric,
+        title=(
+            "H3 — Évaluation de l'idée\n"
+            f"{metric} × rating"
+        ),
+        output_path=(
+            output_dir
+            / f"h3_{metric}_rating_facets.png"
+        ),
+        correlation_method=correlation_method,
+        x_label="Rating",
+        y_label=metric,
+        x_jitter=True,
     )
 
-    ax.set_title(
-        f"H3 — Corrélations intra-sujet\n"
-        f"{metric} × rating"
+    # Forest plot.
+    plot_correlation_forest(
+        correlations_df=correlations,
+        group_result=group_result,
+        title=(
+            "H3 — Corrélations intra-sujets\n"
+            f"{metric} × rating"
+        ),
+        output_path=(
+            output_dir
+            / f"h3_{metric}_rating_forest.png"
+        ),
     )
-
-    ax.set_xlabel("Participant")
-    ax.set_ylabel("r intra-sujet")
-    ax.grid(axis="y", alpha=0.25)
-
-    fig.tight_layout()
-
-    fig.savefig(
-        output_dir / f"h3_{metric}_rating_subject_r.png",
-        dpi=150,
-    )
-
-    plt.show()
 
     return {
+        "data": df,
         "subject_correlations": correlations,
         "group_result": group_result,
     }

@@ -194,3 +194,48 @@ def process_dataset(
         )
 
     return results
+
+def compute_all_metrics_clean(
+    participants,
+    params,
+    analysis_windows,
+    verbose=True,
+):
+    """
+    Recalcule toutes les métriques pour tous les participants.
+
+    Supprime les anciens exports trial-level et QC avant calcul,
+    afin d'éviter les données obsolètes, les doublons ou les
+    participants retirés du dossier data/.
+    """
+
+    files_to_remove = [
+        TRIAL_DIR / "h1_trials.csv",
+        TRIAL_DIR / "h2_trials.csv",
+        TRIAL_DIR / "h3_trials.csv",
+        TRIAL_DIR / "h4_trials.csv",
+        QC_DIR / "run_qc.csv",
+    ]
+
+    print("\n" + "=" * 70)
+    print("NETTOYAGE DES ANCIENS EXPORTS")
+    print("=" * 70)
+
+    for file_path in files_to_remove:
+        if file_path.exists():
+            file_path.unlink()
+            print(f"✓ Supprimé : {file_path}")
+        else:
+            print(f"· Absent : {file_path}")
+
+    print("\n" + "=" * 70)
+    print("CALCUL COMPLET DES MÉTRIQUES — TOUS LES PARTICIPANTS")
+    print("=" * 70)
+
+    return process_dataset(
+        participants=participants,
+        params=params,
+        analysis_windows=analysis_windows,
+        selected_participants=None,
+        verbose=verbose,
+    )

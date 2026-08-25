@@ -5,12 +5,6 @@ import pandas as pd
 def parse_behavioral(filepath):
     """
     Lecture robuste d'un fichier comportemental.
-
-    Accepte :
-    - CSV virgule
-    - CSV point-virgule
-    - TSV
-    - format texte clé: valeur
     """
 
     for sep in [",", ";", "\t"]:
@@ -71,38 +65,51 @@ def parse_behavioral(filepath):
     return pd.DataFrame(records)
 
 
-def _strict_filter(df, mask, label):
-    """
-    Filtrage strict.
-
-    Si aucune ligne n'est trouvée, retourne un dataframe vide.
-    Cela empêche d'analyser involontairement les données d'un autre
-    participant ou d'un autre run.
-    """
-    filtered = df.loc[mask].copy()
-
-    if filtered.empty:
-        print(f"    ⚠ Aucun enregistrement après filtrage : {label}")
-
-    return filtered
+def _clean_category(series):
+    return (
+        series.astype(str)
+        .str.strip()
+        .replace({
+            "": np.nan,
+            "nan": np.nan,
+            "NaN": np.nan,
+            "None": np.nan,
+            "?": np.nan,
+        })
+    )
 
 
 def get_trials_for_run(
     behav_all,
-    participant_id,
-    run_id,
+    participant_id=None,
+    run_id=None,
     section_id=None,
+    already_one_run_file=False,
 ):
     """
-    Extrait les essais d'un participant et d'un run.
+    Extrait les essais d'un run.
 
-    Retourne
-    --------
-    trials : pd.DataFrame
-        Essais valides du run.
+    Parameters
+    ----------
+    behav_all : pd.DataFrame
+        Données comportementales.
 
-    t0 : float
-        Temps t0_fMRI en secondes, ou np.nan si introuvable.
+    participant_id : str | None
+        Utilisé seulement si already_one_run_file=False.
+
+    run_id : int | None
+        Utilisé seulement si already_one_run_file=False.
+
+    section_id : int | None
+        Utilisé seulement si already_one_run_file=False.
+
+    already_one_run_file : bool
+        True si le fichier est déjà spécifique à un participant et un run,
+        par exemple :
+
+            FGAT_Dist_Run0_C4X016.csv
+
+        Dans ce cas, aucun filtre participant/run/section n'est appliqué.
     """
 
     if behav_all is None or len(behav_all) == 0:
@@ -115,66 +122,107 @@ def get_trials_for_run(
         for column in df.columns
     ]
 
+    print("\n    Diagnostic comportemental :")
+    print(f"    Colonnes : {list(df.columns)}")
+    print(f"    Nombre de lignes brutes : {len(df)}")
+
     # ─────────────────────────────────────────────────────────
-    # Participant
+    # IMPORTANT :
+    # Avec un fichier déjà spécifique à un run, on ne filtre pas.
     # ─────────────────────────────────────────────────────────
 
-    if "participant" in df.columns:
-        participant_values = (
-            df["participant"]
-            .astype(str)
-            .str.strip()
+    if already_one_run_file:
+        print(
+            "    CSV déjà spécifique au run : "
+            "aucun filtrage participant/run/section."
         )
 
-        df = _strict_filter(
-            df,
-            participant_values == str(participant_id),
-            label=f"participant={participant_id}",
-        )
+    else:
+        # ─────────────────────────────────────────────────────
+        # Participant
+        # ─────────────────────────────────────────────────────
 
-        if df.empty:
-            return pd.DataFrame(), np.nan
+        if participant_id is not None and "participant" in df.columns:
+            participant_values = (
+                df["participant"]
+                .astype(str)
+                .str.strip()
+            )
+
+            mask = participant_values == str(participant_id)
+
+            if not mask.any():
+                print(
+                    f"    ⚠ Aucun participant trouvé : "
+                    f"{participant_id}"
+                )
+                print(
+                    "    Valeurs participant disponibles :",
+                    participant_values.unique().tolist()
+                )
+                return pd.DataFrame(), np.nan
+
+            df = df.loc[mask].copy()
+
+        # ─────────────────────────────────────────────────────
+        # Run
+        # ─────────────────────────────────────────────────────
+
+        if run_id is not None and "run_id" in df.columns:
+            run_values = pd.to_numeric(
+                df["run_id"],
+                errors="coerce",
+            )
+
+            mask = run_values == float(run_id)
+
+            if not mask.any():
+                print(
+                    f"    ⚠ Aucun run trouvé : {run_id}"
+                )
+                print(
+                    "    Valeurs run_id disponibles :",
+                    sorted(
+                        run_values.dropna()
+                        .unique()
+                        .tolist()
+                    )
+                )
+                return pd.DataFrame(), np.nan
+
+            df = df.loc[mask].copy()
+
+        # ─────────────────────────────────────────────────────
+        # Section
+        # ─────────────────────────────────────────────────────
+
+        if section_id is not None and "section_id" in df.columns:
+            section_values = pd.to_numeric(
+                df["section_id"],
+                errors="coerce",
+            )
+
+            mask = section_values == float(section_id)
+
+            if not mask.any():
+                print(
+                    f"    ⚠ Aucune section trouvée : "
+                    f"{section_id}"
+                )
+                print(
+                    "    Valeurs section_id disponibles :",
+                    sorted(
+                        section_values.dropna()
+                        .unique()
+                        .tolist()
+                    )
+                )
+                return pd.DataFrame(), np.nan
+
+            df = df.loc[mask].copy()
 
     # ─────────────────────────────────────────────────────────
-    # Run
-    # ─────────────────────────────────────────────────────────
-
-    if "run_id" in df.columns:
-        run_values = pd.to_numeric(
-            df["run_id"],
-            errors="coerce",
-        )
-
-        df = _strict_filter(
-            df,
-            run_values == float(run_id),
-            label=f"run_id={run_id}",
-        )
-
-        if df.empty:
-            return pd.DataFrame(), np.nan
-
-    # ─────────────────────────────────────────────────────────
-    # Section
-    # ─────────────────────────────────────────────────────────
-
-    if section_id is not None and "section_id" in df.columns:
-        section_values = pd.to_numeric(
-            df["section_id"],
-            errors="coerce",
-        )
-
-        df = _strict_filter(
-            df,
-            section_values == float(section_id),
-            label=f"section_id={section_id}",
-        )
-
-        if df.empty:
-            return pd.DataFrame(), np.nan
-
-    # ─────────────────────────────────────────────────────────
-    # Ligne TIMING
+    # Détection des lignes TIMING
     # ─────────────────────────────────────────────────────────
 
     if "task" in df.columns:
@@ -208,7 +256,7 @@ def get_trials_for_run(
         if len(values):
             t0 = float(values.iloc[0])
 
-    # Fallback : chercher dans l'ensemble du fichier du run.
+    # Fallback sur toutes les lignes du CSV.
     if not np.isfinite(t0) and "t0_fMRI" in df.columns:
         values = pd.to_numeric(
             df["t0_fMRI"],
@@ -219,7 +267,7 @@ def get_trials_for_run(
             t0 = float(values.iloc[0])
 
     # ─────────────────────────────────────────────────────────
-    # Essais
+    # Extraction essais
     # ─────────────────────────────────────────────────────────
 
     if "trial_n" in df.columns:
@@ -237,37 +285,29 @@ def get_trials_for_run(
         trials = df.loc[trial_mask].copy()
 
     else:
+        # Si trial_n est absent, toutes les lignes non-TIMING sont
+        # considérées comme essais potentiels.
         trials = df.loc[~timing_mask].copy()
 
     trials.reset_index(drop=True, inplace=True)
 
     # ─────────────────────────────────────────────────────────
-    # Nettoyage catégories
+    # Nettoyage catégorie émotionnelle
     # ─────────────────────────────────────────────────────────
 
     if "stim_category" in trials.columns:
-        trials["stim_category"] = (
+        trials["stim_category"] = _clean_category(
             trials["stim_category"]
-            .astype(str)
-            .str.strip()
-            .replace({
-                "": np.nan,
-                "nan": np.nan,
-                "NaN": np.nan,
-                "None": np.nan,
-                "?": np.nan,
-            })
         )
 
     print(
-        f"    extraction run {run_id}: "
-        f"{len(trials)} essais | "
+        f"    Extraction : {len(trials)} essais | "
         f"t0={t0}"
     )
 
     if "stim_category" in trials.columns:
         print(
-            "    catégories :",
+            "    Catégories :",
             trials["stim_category"]
             .value_counts(dropna=False)
             .to_dict(),
