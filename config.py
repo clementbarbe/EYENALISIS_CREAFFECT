@@ -12,12 +12,16 @@ class Config:
     """Paramètres globaux, modifiables sans toucher aux modules."""
 
     # -----------------------------
-    # Chemins / sorties
+    # Sorties
     # -----------------------------
-    output_dir_name: str = "eyetracking_fgat_outputs"
+    output_dir_name: str = "output"
     figures_dir_name: str = "figures"
     tables_dir_name: str = "tables"
     logs_dir_name: str = "logs"
+
+    # Produire également des figures pour les hypothèses non estimables :
+    # elles porteront l'annotation "modèle non estimable" ou la raison.
+    plot_non_estimable_hypotheses: bool = True
 
     # -----------------------------
     # Acquisition
@@ -101,15 +105,28 @@ class Config:
 DEFAULT_CONFIG = Config()
 
 
-def make_output_dirs(root: Path, cfg: Config) -> dict[str, Path]:
-    """Crée et retourne les répertoires de sortie."""
-    out = root / cfg.output_dir_name
+def make_output_dirs(output_root: Path, cfg: Config) -> dict[str, Path]:
+    """
+    Crée et retourne une arborescence de sortie structurée.
+
+    Parameters
+    ----------
+    output_root:
+        Dossier parent où le dossier output sera créé.
+    """
+    out = output_root / cfg.output_dir_name
+
     paths = {
         "root": out,
         "figures": out / cfg.figures_dir_name,
         "tables": out / cfg.tables_dir_name,
         "logs": out / cfg.logs_dir_name,
+        "figures_exclusion": out / cfg.figures_dir_name / "exclusion",
+        "figures_heatmaps": out / cfg.figures_dir_name / "heatmaps",
+        "figures_hypotheses": out / cfg.figures_dir_name / "hypotheses",
     }
+
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
+
     return paths

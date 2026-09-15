@@ -67,3 +67,114 @@ def evaluate_subject_exclusion(run_qc: pd.DataFrame, cfg: Config) -> pd.DataFram
         f"fewer_than_{cfg.min_valid_runs_per_subject}_valid_runs",
     )
     return summary
+
+def summarize_run_exclusions(run_qc: pd.DataFrame) -> pd.DataFrame:
+    """
+    Résume les raisons d'exclusion des runs.
+
+    Une même ligne peut contenir plusieurs raisons séparées par ';'.
+    La fonction sépare ces raisons afin de les compter individuellement.
+    """
+    excluded = run_qc.loc[
+        ~run_qc["run_valid"].fillna(False)
+    ].copy()
+
+    if excluded.empty:
+        return pd.DataFrame(columns=["reason", "n_runs"])
+
+    excluded["run_exclusion_reason"] = (
+        excluded["run_exclusion_reason"]
+        .fillna("unknown")
+        .replace("", "unknown")
+    )
+
+    exploded = (
+        excluded.assign(
+            reason=excluded["run_exclusion_reason"].str.split(";")
+        )
+        .explode("reason")
+    )
+
+    summary = (
+        exploded.groupby("reason", as_index=False)
+        .size()
+        .rename(columns={"size": "n_runs"})
+        .sort_values("n_runs", ascending=False)
+    )
+
+    return summary
+
+
+def summarize_subject_exclusions(subject_qc: pd.DataFrame) -> pd.DataFrame:
+    """Résume les raisons d'exclusion au niveau sujet."""
+    excluded = subject_qc.loc[
+        ~subject_qc["subject_valid"].fillna(False)
+    ].copy()
+
+    if excluded.empty:
+        return pd.DataFrame(columns=["reason", "n_subjects"])
+
+    excluded["subject_exclusion_reason"] = (
+        excluded["subject_exclusion_reason"]
+        .fillna("unknown")
+        .replace("", "unknown")
+    )
+
+    return (
+        excluded.groupby("subject_exclusion_reason", as_index=False)
+        .size()
+        .rename(columns={
+            "subject_exclusion_reason": "reason",
+            "size": "n_subjects",
+        })
+        .sort_values("n_subjects", ascending=False)
+    )
+
+
+def summarize_moment_exclusions(metrics_long: pd.DataFrame) -> pd.DataFrame:
+    """
+    Résume les exclusions au niveau essai × moment.
+
+    Comme metrics_long contient une ligne par métrique, on déduplique les
+    fenêtres avant de compter les exclusions, afin de ne pas compter une même
+    fenêtre une fois par métrique.
+    """
+    key_columns = [
+        "subject_id",
+        "run_id",
+        "trial_n",
+        "moment",
+        "moment_valid",
+        "moment_exclusion_reason",
+    ]
+
+    available = [col for col in key_columns if col in metrics_long.columns]
+    windows = metrics_long[available].drop_duplicates()
+
+    excluded = windows.loc[
+        ~windows["moment_valid"].fillna(False)
+    ].copy()
+
+    if excluded.empty:
+        return pd.DataFrame(columns=["moment", "reason", "n_windows"])
+
+    excluded["moment_exclusion_reason"] = (
+        excluded["moment_exclusion_reason"]
+        .fillna("unknown")
+        .replace("", "unknown")
+    )
+
+    summary = (
+        excluded.groupby(
+            ["moment", "moment_exclusion_reason"],
+            as_index=False,
+        )
+        .size()
+        .rename(columns={
+            "moment_exclusion_reason": "reason",
+            "size": "n_windows",
+        })
+        .sort_values(["moment", "n_windows"], ascending=[True, False])
+    )
+
+    return summary

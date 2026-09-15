@@ -10,7 +10,14 @@ import numpy as np
 import pandas as pd
 
 from config import DEFAULT_CONFIG, make_output_dirs
-from exclusion import evaluate_run_exclusion, evaluate_subject_exclusion
+from exclusion import (
+    evaluate_run_exclusion,
+    evaluate_subject_exclusion,
+    summarize_moment_exclusions,
+    summarize_run_exclusions,
+    summarize_subject_exclusions,
+)
+
 from metrics import extract_metrics
 from moments import build_moment_windows
 from parsing_behavior import parse_behavior_csv
@@ -18,7 +25,13 @@ from parsing_eyetracking import parse_asc
 from preprocessing import preprocess_pupil
 from stats import fit_mixed_models
 from sync import synchronize_run
-from viz import plot_distribution, plot_exclusion_funnel, plot_fdr_heatmap
+
+from viz import (
+    plot_distribution,
+    plot_exclusion_funnel,
+    plot_fdr_heatmap,
+    plot_run_exclusion_reasons,
+)
 
 
 def discover_subjects(root: Path) -> list[Path]:
@@ -205,10 +218,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Pipeline eyetracking pupillométrie FGAT_Dist."
     )
+
     parser.add_argument(
         "data_root",
         type=Path,
         help="Dossier racine contenant les dossiers C4X###.",
     )
+
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Dossier parent dans lequel créer output/. "
+            "Par défaut : le dossier data_root."
+        ),
+    )
+
     args = parser.parse_args()
-    main(args.data_root)
+
+    output_parent = args.output_dir if args.output_dir is not None else args.data_root
+    main(args.data_root, output_parent)
