@@ -1,4 +1,4 @@
-"""Création des fenêtres temporelles des moments expérimentaux."""
+"""Construction des fenêtres temporelles expérimentales."""
 
 from __future__ import annotations
 
@@ -16,9 +16,7 @@ def _create_window(
     requested_duration_s: float,
     cfg: Config,
 ) -> dict:
-    """Construit une fenêtre potentiellement tronquée."""
-    available_duration_s = max(0.0, available_end_s - start_s)
-
+    """Construit une fenêtre tronquée si nécessaire."""
     end_s = min(
         available_end_s,
         start_s + requested_duration_s,
@@ -31,9 +29,14 @@ def _create_window(
         "start_behavior_s": start_s,
         "end_behavior_s": end_s,
         "requested_duration_s": requested_duration_s,
-        "available_duration_s": available_duration_s,
+        "available_duration_s": max(
+            0.0,
+            available_end_s - start_s,
+        ),
         "actual_duration_s": actual_duration_s,
-        "duration_valid": actual_duration_s >= cfg.minimum_usable_window_s,
+        "duration_valid": (
+            actual_duration_s >= cfg.minimum_usable_window_s
+        ),
     }
 
 
@@ -44,34 +47,31 @@ def build_moment_windows(
     cfg: Config,
 ) -> pd.DataFrame:
     """
-    Construit les fenêtres M1, M2a, M2b, M3a et M3b.
+    Crée M1, M2a, M2b, M3a et M3b.
 
-    M1 est calculé seulement pour l'essai portant réellement l'induction,
-    afin de ne pas tripler artificiellement une même induction de 10 s.
+    M1 est créé une fois par induction, seulement sur has_induction=True.
     """
     rows: list[dict] = []
 
     for _, trial in trials.iterrows():
-        candidate_windows: list[dict] = []
+        windows: list[dict] = []
 
-        # Moment 1 : induction, uniquement premier essai du bloc.
         if (
             bool(trial["has_induction"])
             and pd.notna(trial["emo_stim_onset"])
         ):
             onset = float(trial["emo_stim_onset"])
 
-            candidate_windows.append(
+            windows.append(
                 _create_window(
-                    moment="M1_induction",
-                    start_s=onset,
-                    available_end_s=onset + cfg.induction_duration_s,
-                    requested_duration_s=cfg.induction_duration_s,
-                    cfg=cfg,
+                    "M1_induction",
+                    onset,
+                    onset + cfg.induction_duration_s,
+                    cfg.induction_duration_s,
+                    cfg,
                 )
             )
 
-        # Moment 2a et 2b : recherche d'association.
         cue = trial.get("fgat_cue_onset", np.nan)
         response = trial.get("fgat_input_time", np.nan)
 
@@ -79,32 +79,31 @@ def build_moment_windows(
             cue = float(cue)
             response = float(response)
 
-            candidate_windows.append(
+            windows.append(
                 _create_window(
-                    moment="M2a_search_start",
-                    start_s=cue,
-                    available_end_s=response,
-                    requested_duration_s=cfg.moment_window_s["M2a_search_start"],
-                    cfg=cfg,
+                    "M2a_search_start",
+                    cue,
+                    response,
+                    cfg.moment_window_s["M2a_search_start"],
+                    cfg,
                 )
             )
 
-            end_window_start = max(
+            start_end_window = max(
                 cue,
                 response - cfg.moment_window_s["M2b_search_end"],
             )
 
-            candidate_windows.append(
+            windows.append(
                 _create_window(
-                    moment="M2b_search_end",
-                    start_s=end_window_start,
-                    available_end_s=response,
-                    requested_duration_s=cfg.moment_window_s["M2b_search_end"],
-                    cfg=cfg,
+                    "M2b_search_end",
+                    start_end_window,
+                    response,
+                    cfg.moment_window_s["M2b_search_end"],
+                    cfg,
                 )
             )
 
-        # Moment 3a et 3b : évaluation.
         rating_onset = trial.get("LTask_onset", np.nan)
         validation = trial.get("LTask_validation", np.nan)
 
@@ -112,62 +111,63 @@ def build_moment_windows(
             rating_onset = float(rating_onset)
             validation = float(validation)
 
-            candidate_windows.append(
+            windows.append(
                 _create_window(
-                    moment="M3a_rating_start",
-                    start_s=rating_onset,
-                    available_end_s=validation,
-                    requested_duration_s=cfg.moment_window_s["M3a_rating_start"],
-                    cfg=cfg,
+                    "M3a_rating_start",
+                    rating_onset,
+                    validation,
+                    cfg.moment_window_s["M3a_rating_start"],
+                    cfg,
                 )
             )
 
-            end_window_start = max(
+            start_end_window = max(
                 rating_onset,
                 validation - cfg.moment_window_s["M3b_rating_end"],
             )
 
-            candidate_windows.append(
+            windows.append(
                 _create_window(
-                    moment="M3b_rating_end",
-                    start_s=end_window_start,
-                    available_end_s=validation,
-                    requested_duration_s=cfg.moment_window_s["M3b_rating_end"],
-                    cfg=cfg,
+                    "M3b_rating_end",
+                    start_end_window,
+                    validation,
+                    cfg.moment_window_s["M3b_rating_end"],
+                    cfg,
                 )
             )
 
-        for window in candidate_windows:
-            start_eyelink_ms = behavioral_to_eyelink_ms(
-                behavioral_time_s=window["start_behavior_s"],
-                timing=timing,
-                sync=sync,
+        for window in windows:
+            start_ms = behavioral_to_eyelink_ms(
+                window["start_behavior_s"],
+                timing,
+                sync,
             )
 
-            end_eyelink_ms = behavioral_to_eyelink_ms(
-                behavioral_time_s=window["end_behavior_s"],
-                timing=timing,
-                sync=sync,
+            end_ms = behavioral_to_eyelink_ms(
+                window["end_behavior_s"],
+                timing,
+                sync,
             )
 
-            baseline_start_behavior_s = (
-                window["start_behavior_s"] - cfg.baseline_duration_s
+            baseline_start_s = (
+                window["start_behavior_s"]
+                - cfg.baseline_duration_s
             )
 
-            baseline_start_eyelink_ms = behavioral_to_eyelink_ms(
-                behavioral_time_s=baseline_start_behavior_s,
-                timing=timing,
-                sync=sync,
+            baseline_start_ms = behavioral_to_eyelink_ms(
+                baseline_start_s,
+                timing,
+                sync,
             )
 
             rows.append(
                 {
                     **trial.to_dict(),
                     **window,
-                    "start_eyelink_ms": start_eyelink_ms,
-                    "end_eyelink_ms": end_eyelink_ms,
-                    "baseline_start_eyelink_ms": baseline_start_eyelink_ms,
-                    "baseline_end_eyelink_ms": start_eyelink_ms,
+                    "start_eyelink_ms": start_ms,
+                    "end_eyelink_ms": end_ms,
+                    "baseline_start_eyelink_ms": baseline_start_ms,
+                    "baseline_end_eyelink_ms": start_ms,
                 }
             )
 

@@ -14,7 +14,7 @@ def evaluate_run_exclusion(
     sync: SyncResult,
     cfg: Config,
 ) -> dict:
-    """Évalue si un run doit être exclu."""
+    """Détermine si un run est valide."""
     reasons: list[str] = []
 
     if not sync.success:
@@ -36,21 +36,26 @@ def evaluate_run_exclusion(
             "run_exclusion_reason": ";".join(reasons),
         }
 
-    missing_fraction = float(preprocessed["pupil_missing_raw"].mean())
+    missing_fraction = float(
+        preprocessed["pupil_missing_raw"].mean()
+    )
 
     valid_pupil = preprocessed["pupil_clean"].dropna()
-    n_unique_pupil = int(valid_pupil.nunique())
+    unique_pupil_values = int(valid_pupil.nunique())
 
     if missing_fraction > cfg.max_run_missing_fraction:
         reasons.append("run_missing_fraction_above_threshold")
 
-    if valid_pupil.empty or n_unique_pupil < cfg.min_unique_pupil_values:
+    if (
+        valid_pupil.empty
+        or unique_pupil_values < cfg.min_unique_pupil_values
+    ):
         reasons.append("implausible_or_constant_pupil")
 
     return {
         "run_valid": len(reasons) == 0,
         "run_missing_fraction": missing_fraction,
-        "run_unique_pupil_values": n_unique_pupil,
+        "run_unique_pupil_values": unique_pupil_values,
         "run_exclusion_reason": ";".join(reasons),
     }
 
@@ -59,7 +64,7 @@ def evaluate_subject_exclusion(
     run_qc: pd.DataFrame,
     cfg: Config,
 ) -> pd.DataFrame:
-    """Exclut les sujets ayant trop peu de runs valides."""
+    """Exclut les sujets avec moins de N runs valides."""
     subject_qc = (
         run_qc.groupby("subject_id", as_index=False)["run_valid"]
         .sum()
@@ -67,7 +72,8 @@ def evaluate_subject_exclusion(
     )
 
     subject_qc["subject_valid"] = (
-        subject_qc["n_valid_runs"] >= cfg.min_valid_runs_per_subject
+        subject_qc["n_valid_runs"]
+        >= cfg.min_valid_runs_per_subject
     )
 
     subject_qc["subject_exclusion_reason"] = np.where(
@@ -79,7 +85,9 @@ def evaluate_subject_exclusion(
     return subject_qc
 
 
-def summarize_run_exclusions(run_qc: pd.DataFrame) -> pd.DataFrame:
+def summarize_run_exclusions(
+    run_qc: pd.DataFrame,
+) -> pd.DataFrame:
     """Compte les raisons d'exclusion des runs."""
     excluded = run_qc.loc[
         ~run_qc["run_valid"].fillna(False)
@@ -109,7 +117,9 @@ def summarize_run_exclusions(run_qc: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def summarize_subject_exclusions(subject_qc: pd.DataFrame) -> pd.DataFrame:
+def summarize_subject_exclusions(
+    subject_qc: pd.DataFrame,
+) -> pd.DataFrame:
     """Compte les raisons d'exclusion des sujets."""
     excluded = subject_qc.loc[
         ~subject_qc["subject_valid"].fillna(False)
@@ -125,7 +135,10 @@ def summarize_subject_exclusions(subject_qc: pd.DataFrame) -> pd.DataFrame:
     )
 
     return (
-        excluded.groupby("subject_exclusion_reason", as_index=False)
+        excluded.groupby(
+            "subject_exclusion_reason",
+            as_index=False,
+        )
         .size()
         .rename(
             columns={
@@ -137,14 +150,11 @@ def summarize_subject_exclusions(subject_qc: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def summarize_moment_exclusions(metrics_long: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compte les exclusions essai x moment.
-
-    Les lignes sont dédupliquées car metrics_long contient une ligne
-    par métrique, pas une seule ligne par fenêtre.
-    """
-    key_columns = [
+def summarize_moment_exclusions(
+    metrics_long: pd.DataFrame,
+) -> pd.DataFrame:
+    """Compte les exclusions au niveau essai x moment."""
+    keys = [
         "subject_id",
         "run_id",
         "trial_n",
@@ -153,19 +163,16 @@ def summarize_moment_exclusions(metrics_long: pd.DataFrame) -> pd.DataFrame:
         "moment_exclusion_reason",
     ]
 
-    available = [col for col in key_columns if col in metrics_long.columns]
-
-    if not available:
-        return pd.DataFrame(columns=["moment", "reason", "n_windows"])
-
-    windows = metrics_long[available].drop_duplicates()
+    windows = metrics_long[keys].drop_duplicates()
 
     excluded = windows.loc[
         ~windows["moment_valid"].fillna(False)
     ].copy()
 
     if excluded.empty:
-        return pd.DataFrame(columns=["moment", "reason", "n_windows"])
+        return pd.DataFrame(
+            columns=["moment", "reason", "n_windows"]
+        )
 
     excluded["moment_exclusion_reason"] = (
         excluded["moment_exclusion_reason"]
@@ -185,5 +192,8 @@ def summarize_moment_exclusions(metrics_long: pd.DataFrame) -> pd.DataFrame:
                 "size": "n_windows",
             }
         )
-        .sort_values(["moment", "n_windows"], ascending=[True, False])
+        .sort_values(
+            ["moment", "n_windows"],
+            ascending=[True, False],
+        )
     )

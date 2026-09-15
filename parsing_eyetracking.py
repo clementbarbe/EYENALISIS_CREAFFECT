@@ -1,4 +1,4 @@
-"""Parseur défensif de fichiers EyeLink ASCII (.asc)."""
+"""Parseur défensif EyeLink ASCII (.asc)."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ EVENT_COLUMNS = [
 
 
 def _to_float(value: str) -> float:
-    """Convertit une valeur en float ou NaN."""
+    """Convertit une valeur texte en float ou NaN."""
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -40,7 +40,7 @@ def _to_float(value: str) -> float:
 
 
 def _new_event(event_type: str, raw_line: str) -> dict[str, Any]:
-    """Initialise une ligne d'évènement."""
+    """Initialise un évènement EyeLink."""
     event = {column: np.nan for column in EVENT_COLUMNS}
     event["event_type"] = event_type
     event["raw_line"] = raw_line
@@ -49,19 +49,24 @@ def _new_event(event_type: str, raw_line: str) -> dict[str, Any]:
 
 def parse_asc(asc_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Parse un fichier EyeLink ASCII.
+    Parse un fichier ASC EyeLink.
 
     Returns
     -------
     samples:
-        Colonnes timestamp_ms, gaze_x, gaze_y, pupil_size.
+        timestamp_ms, gaze_x, gaze_y, pupil_size.
     events:
-        Evènements EyeLink structurés.
+        Tableau d'évènements EyeLink.
     """
     samples: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
 
-    with asc_path.open("r", encoding="latin-1", errors="replace") as file:
+    with asc_path.open(
+        "r",
+        encoding="latin-1",
+        errors="replace",
+    ) as file:
+
         for raw_line in file:
             line = raw_line.strip()
 
@@ -69,10 +74,11 @@ def parse_asc(asc_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
                 continue
 
             tokens = line.split()
-            first = tokens[0]
+            first_token = tokens[0]
 
-            # Echantillon brut : timestamp gaze_x gaze_y pupil_size ...
-            if first.lstrip("-").isdigit():
+            # Echantillon brut :
+            # <timestamp> <gaze_x> <gaze_y> <pupil_size> ...
+            if first_token.lstrip("-").isdigit():
                 if len(tokens) >= 4:
                     samples.append(
                         {
@@ -84,30 +90,30 @@ def parse_asc(asc_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
                     )
                 continue
 
-            if first == "BUTTON" and len(tokens) >= 4:
-                event = _new_event(first, line)
+            if first_token == "BUTTON" and len(tokens) >= 4:
+                event = _new_event(first_token, line)
                 event["timestamp_ms"] = _to_float(tokens[1])
                 event["button_code"] = _to_float(tokens[2])
                 event["button_state"] = _to_float(tokens[3])
                 events.append(event)
                 continue
 
-            if first == "MSG" and len(tokens) >= 2:
-                event = _new_event(first, line)
+            if first_token == "MSG" and len(tokens) >= 2:
+                event = _new_event(first_token, line)
                 event["timestamp_ms"] = _to_float(tokens[1])
                 events.append(event)
                 continue
 
-            if first == "SFIX" and len(tokens) >= 3:
-                event = _new_event(first, line)
+            if first_token == "SFIX" and len(tokens) >= 3:
+                event = _new_event(first_token, line)
                 event["eye"] = tokens[1]
                 event["timestamp_ms"] = _to_float(tokens[2])
                 events.append(event)
                 continue
 
             # EFIX R start end duration mean_x mean_y mean_pupil
-            if first == "EFIX" and len(tokens) >= 8:
-                event = _new_event(first, line)
+            if first_token == "EFIX" and len(tokens) >= 8:
+                event = _new_event(first_token, line)
                 event["eye"] = tokens[1]
                 event["start_ms"] = _to_float(tokens[2])
                 event["end_ms"] = _to_float(tokens[3])
@@ -118,16 +124,16 @@ def parse_asc(asc_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
                 events.append(event)
                 continue
 
-            if first == "SSACC" and len(tokens) >= 3:
-                event = _new_event(first, line)
+            if first_token == "SSACC" and len(tokens) >= 3:
+                event = _new_event(first_token, line)
                 event["eye"] = tokens[1]
                 event["timestamp_ms"] = _to_float(tokens[2])
                 events.append(event)
                 continue
 
             # ESACC R start end duration xstart ystart xend yend amp peakvel
-            if first == "ESACC" and len(tokens) >= 11:
-                event = _new_event(first, line)
+            if first_token == "ESACC" and len(tokens) >= 11:
+                event = _new_event(first_token, line)
                 event["eye"] = tokens[1]
                 event["start_ms"] = _to_float(tokens[2])
                 event["end_ms"] = _to_float(tokens[3])
@@ -142,8 +148,8 @@ def parse_asc(asc_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
                 continue
 
             # EBLINK R start end duration
-            if first == "EBLINK" and len(tokens) >= 5:
-                event = _new_event(first, line)
+            if first_token == "EBLINK" and len(tokens) >= 5:
+                event = _new_event(first_token, line)
                 event["eye"] = tokens[1]
                 event["start_ms"] = _to_float(tokens[2])
                 event["end_ms"] = _to_float(tokens[3])
@@ -152,30 +158,37 @@ def parse_asc(asc_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
                 continue
 
             # SBLINK R timestamp
-            if first == "SBLINK" and len(tokens) >= 3:
-                event = _new_event(first, line)
+            if first_token == "SBLINK" and len(tokens) >= 3:
+                event = _new_event(first_token, line)
                 event["eye"] = tokens[1]
                 event["timestamp_ms"] = _to_float(tokens[2])
                 events.append(event)
                 continue
 
-    sample_df = pd.DataFrame(samples)
+    samples_df = pd.DataFrame(samples)
 
-    if sample_df.empty:
-        sample_df = pd.DataFrame(
-            columns=["timestamp_ms", "gaze_x", "gaze_y", "pupil_size"]
+    if samples_df.empty:
+        samples_df = pd.DataFrame(
+            columns=[
+                "timestamp_ms",
+                "gaze_x",
+                "gaze_y",
+                "pupil_size",
+            ]
         )
     else:
-        sample_df = sample_df.sort_values("timestamp_ms").reset_index(drop=True)
+        samples_df = samples_df.sort_values(
+            "timestamp_ms"
+        ).reset_index(drop=True)
 
-    event_df = pd.DataFrame(events)
+    events_df = pd.DataFrame(events)
 
-    if event_df.empty:
-        event_df = pd.DataFrame(columns=EVENT_COLUMNS)
+    if events_df.empty:
+        events_df = pd.DataFrame(columns=EVENT_COLUMNS)
     else:
-        event_df = event_df.sort_values(
-            by=["timestamp_ms", "start_ms"],
+        events_df = events_df.sort_values(
+            ["timestamp_ms", "start_ms"],
             na_position="last",
         ).reset_index(drop=True)
 
-    return sample_df, event_df
+    return samples_df, events_df

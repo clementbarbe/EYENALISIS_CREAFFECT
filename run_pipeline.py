@@ -1,4 +1,4 @@
-"""Point d'entrée du pipeline FGAT x eyetracking."""
+"""Point d'entrée du pipeline FGAT eyetracking."""
 
 from __future__ import annotations
 
@@ -28,12 +28,13 @@ from viz import (
     plot_distribution,
     plot_exclusion_funnel,
     plot_fdr_heatmap,
+    plot_results_table_png,
     plot_run_exclusion_reasons,
 )
 
 
 def discover_subjects(data_root: Path) -> list[Path]:
-    """Trouve automatiquement tous les dossiers C4X###."""
+    """Trouve tous les dossiers C4X###."""
     return sorted(
         directory
         for directory in data_root.iterdir()
@@ -47,8 +48,10 @@ def find_run_files(
     subject_id: str,
     run_id: int,
 ) -> tuple[Path | None, Path | None]:
-    """Trouve le CSV FGAT et le fichier ASC correspondant."""
-    csv_path = subject_dir / f"FGAT_Dist_Run{run_id}_C4X{subject_id}.csv"
+    """Trouve le CSV comportemental et le fichier ASC d'un run."""
+    csv_path = subject_dir / (
+        f"FGAT_Dist_Run{run_id}_C4X{subject_id}.csv"
+    )
 
     asc_candidates = [
         subject_dir / f"{subject_id}_{run_id}.asc",
@@ -56,7 +59,11 @@ def find_run_files(
     ]
 
     asc_path = next(
-        (candidate for candidate in asc_candidates if candidate.exists()),
+        (
+            candidate
+            for candidate in asc_candidates
+            if candidate.exists()
+        ),
         None,
     )
 
@@ -71,13 +78,13 @@ def process_run(
     subject_id: str,
     run_id: int,
 ) -> tuple[pd.DataFrame, dict]:
-    """Traite un run sans arrêter le pipeline si une erreur survient."""
+    """Traite un run sans interrompre tout le pipeline."""
     cfg = DEFAULT_CONFIG
 
     csv_path, asc_path = find_run_files(
-        subject_dir=subject_dir,
-        subject_id=subject_id,
-        run_id=run_id,
+        subject_dir,
+        subject_id,
+        run_id,
     )
 
     qc = {
@@ -102,52 +109,51 @@ def process_run(
 
     try:
         trials, timing = parse_behavior_csv(
-            csv_path=csv_path,
-            subject_id=subject_id,
-            run_id=run_id,
+            csv_path,
+            subject_id,
+            run_id,
         )
 
         samples, events = parse_asc(asc_path)
 
         sync = synchronize_run(
-            events=events,
-            timing=timing,
-            samples=samples,
-            cfg=cfg,
+            events,
+            timing,
+            samples,
+            cfg,
         )
 
         qc["sync_quality_flag"] = sync.quality_flag
         qc["sync_end_difference_s"] = sync.end_difference_s
 
         preprocessed = preprocess_pupil(
-            samples=samples,
-            events=events,
-            cfg=cfg,
+            samples,
+            events,
+            cfg,
         )
 
-        run_evaluation = evaluate_run_exclusion(
-            preprocessed=preprocessed,
-            sync=sync,
-            cfg=cfg,
+        qc.update(
+            evaluate_run_exclusion(
+                preprocessed,
+                sync,
+                cfg,
+            )
         )
 
-        qc.update(run_evaluation)
-
-        # Inutile de calculer les moments si run déjà exclu.
         if not qc["run_valid"]:
             return pd.DataFrame(), qc
 
         windows = build_moment_windows(
-            trials=trials,
-            timing=timing,
-            sync=sync,
-            cfg=cfg,
+            trials,
+            timing,
+            sync,
+            cfg,
         )
 
         metrics = extract_metrics(
-            windows=windows,
-            preprocessed=preprocessed,
-            max_missing_fraction=cfg.max_moment_missing_fraction,
+            windows,
+            preprocessed,
+            cfg.max_moment_missing_fraction,
         )
 
         valid_trials = metrics.loc[
@@ -157,19 +163,22 @@ def process_run(
 
         total_trials = trials["trial_n"].nunique()
 
-        valid_trial_fraction = valid_trials / max(1, total_trials)
+        qc["valid_trial_fraction"] = (
+            valid_trials / max(1, total_trials)
+        )
 
-        qc["valid_trial_fraction"] = valid_trial_fraction
-
-        if valid_trial_fraction < cfg.min_valid_trial_fraction_per_run:
+        if (
+            qc["valid_trial_fraction"]
+            < cfg.min_valid_trial_fraction_per_run
+        ):
             qc["run_valid"] = False
 
-            existing_reason = qc["run_exclusion_reason"]
+            previous_reason = qc["run_exclusion_reason"]
 
             qc["run_exclusion_reason"] = ";".join(
                 reason
                 for reason in [
-                    existing_reason,
+                    previous_reason,
                     "too_few_usable_trials",
                 ]
                 if reason
@@ -184,7 +193,6 @@ def process_run(
         qc["run_exclusion_reason"] = (
             f"{type(exc).__name__}: {exc}"
         )
-
         return pd.DataFrame(), qc
 
 
@@ -207,12 +215,12 @@ def main(
     for subject_dir in subjects:
         subject_id = subject_dir.name.replace("C4X", "")
 
-        # Run0 exclu systématiquement : entraînement.
+        # Run 0 = entraînement : exclu systématiquement.
         for run_id in range(1, 6):
             metrics, qc = process_run(
-                subject_dir=subject_dir,
-                subject_id=subject_id,
-                run_id=run_id,
+                subject_dir,
+                subject_id,
+                run_id,
             )
 
             run_qc_rows.append(qc)
@@ -234,27 +242,30 @@ def main(
         index=False,
     )
 
-    n_runs_valid = int(run_qc["run_valid"].sum())
-
-    print(f"[2/5] Runs valides : {n_runs_valid}/{len(run_qc)}")
+    print(
+        f"[2/5] Runs valides : "
+        f"{int(run_qc['run_valid'].sum())}/{len(run_qc)}"
+    )
 
     if not run_exclusion_summary.empty:
         print("      Raisons d'exclusion des runs :")
 
         for _, row in run_exclusion_summary.iterrows():
-            print(f"      - {row['reason']}: {int(row['n_runs'])}")
+            print(
+                f"      - {row['reason']}: "
+                f"{int(row['n_runs'])}"
+            )
 
-    subject_qc = evaluate_subject_exclusion(
-        run_qc=run_qc,
-        cfg=cfg,
-    )
+    subject_qc = evaluate_subject_exclusion(run_qc, cfg)
 
     subject_qc.to_csv(
         output_dirs["tables"] / "subject_qc.csv",
         index=False,
     )
 
-    subject_exclusion_summary = summarize_subject_exclusions(subject_qc)
+    subject_exclusion_summary = summarize_subject_exclusions(
+        subject_qc
+    )
 
     subject_exclusion_summary.to_csv(
         output_dirs["tables"] / "subject_exclusion_summary.csv",
@@ -269,23 +280,29 @@ def main(
     )
 
     print(
-        f"[3/5] Sujets retenus : {len(kept_subjects)}/{len(subject_qc)} "
+        f"[3/5] Sujets retenus : "
+        f"{len(kept_subjects)}/{len(subject_qc)} "
         f"(minimum {cfg.min_valid_runs_per_subject} runs)"
     )
 
     if not subject_exclusion_summary.empty:
-        print("      Raisons d'exclusion des sujets:")
+        print("      Raisons d'exclusion des sujets :")
 
         for _, row in subject_exclusion_summary.iterrows():
-            print(f"      - {row['reason']}: {int(row['n_subjects'])}")
+            print(
+                f"      - {row['reason']}: "
+                f"{int(row['n_subjects'])}"
+            )
 
     if not all_metrics:
         print("[STOP] Aucune métrique exploitable.")
         return
 
-    metrics_long = pd.concat(all_metrics, ignore_index=True)
+    metrics_long = pd.concat(
+        all_metrics,
+        ignore_index=True,
+    )
 
-    # Ne conserve que les sujets ayant >= 3 runs valides.
     metrics_long = metrics_long.loc[
         metrics_long["subject_id"].isin(kept_subjects)
     ].copy()
@@ -295,15 +312,29 @@ def main(
         index=False,
     )
 
-    moment_exclusion_summary = summarize_moment_exclusions(metrics_long)
+    moment_exclusion_summary = summarize_moment_exclusions(
+        metrics_long
+    )
 
     moment_exclusion_summary.to_csv(
         output_dirs["tables"] / "moment_exclusion_summary.csv",
         index=False,
     )
 
+    # Déduplique car metrics_long a une ligne par métrique.
+    window_qc = metrics_long[
+        [
+            "subject_id",
+            "run_id",
+            "trial_n",
+            "moment",
+            "moment_valid",
+            "moment_exclusion_reason",
+        ]
+    ].drop_duplicates()
+
     valid_by_moment = (
-        metrics_long.groupby("moment")["moment_valid"]
+        window_qc.groupby("moment")["moment_valid"]
         .agg(["sum", "count"])
         .rename(
             columns={
@@ -313,7 +344,7 @@ def main(
         )
     )
 
-    print("[4/5] Fenêtres valides par moment:")
+    print("[4/5] Fenêtres valides par moment :")
 
     for moment, row in valid_by_moment.iterrows():
         print(
@@ -322,18 +353,16 @@ def main(
         )
 
     if not moment_exclusion_summary.empty:
-        print("      Raisons d'exclusion des fenêtres:")
+        print("      Raisons d'exclusion des fenêtres :")
 
         for _, row in moment_exclusion_summary.iterrows():
             print(
                 f"      - {row['moment']} | "
-                f"{row['reason']}: {int(row['n_windows'])}"
+                f"{row['reason']}: "
+                f"{int(row['n_windows'])}"
             )
 
-    stats_df = fit_mixed_models(
-        metrics_long=metrics_long,
-        cfg=cfg,
-    )
+    stats_df = fit_mixed_models(metrics_long, cfg)
 
     stats_df.to_csv(
         output_dirs["tables"] / "mixed_models_fdr.csv",
@@ -358,57 +387,66 @@ def main(
             f"effet_std={row['effect_size_std_max_contrast']:.3f}"
         )
 
-    # --------------------------------------------------------------
-    # Graphiques exclusions
-    # --------------------------------------------------------------
+    # Figures exclusions
     plot_exclusion_funnel(
-        run_qc=run_qc,
-        subject_qc=subject_qc,
-        output_dir=output_dirs["figures_exclusion"],
-        cfg=cfg,
+        run_qc,
+        subject_qc,
+        output_dirs["figures_exclusion"],
+        cfg,
     )
 
     plot_run_exclusion_reasons(
-        run_exclusion_summary=run_exclusion_summary,
-        output_dir=output_dirs["figures_exclusion"],
-        cfg=cfg,
+        run_exclusion_summary,
+        output_dirs["figures_exclusion"],
+        cfg,
     )
 
-    # --------------------------------------------------------------
-    # Heatmaps FDR
-    # --------------------------------------------------------------
-    for scheme in ["five_categories", "valence", "arousal"]:
+    schemes = [
+        "five_categories",
+        "valence",
+        "arousal",
+    ]
+
+    # Heatmaps classiques + trois tableaux PNG finaux.
+    for scheme in schemes:
         plot_fdr_heatmap(
-            stats_df=stats_df,
-            scheme=scheme,
-            output_dir=output_dirs["figures_heatmaps"],
-            cfg=cfg,
+            stats_df,
+            scheme,
+            output_dirs["figures_heatmaps"],
+            cfg,
         )
 
-    # --------------------------------------------------------------
-    # Une figure distincte par hypothèse
-    # scheme x moment x metric
-    # --------------------------------------------------------------
+        plot_results_table_png(
+            stats_df,
+            scheme,
+            output_dirs["figures_heatmaps"],
+            cfg,
+        )
+
+    # Figures descriptives séparées par hypothèse.
     for _, row in stats_df.iterrows():
-        model_reliable = bool(row.get("model_reliable", False))
+        reliable = bool(row.get("model_reliable", False))
 
         if (
             not cfg.plot_non_estimable_hypotheses
-            and not model_reliable
+            and not reliable
         ):
             continue
 
         plot_distribution(
-            metrics_long=metrics_long,
-            stats_df=stats_df,
-            scheme=row["scheme"],
-            moment=row["moment"],
-            metric=row["metric"],
-            hypotheses_root=output_dirs["figures_hypotheses"],
-            cfg=cfg,
+            metrics_long,
+            stats_df,
+            row["scheme"],
+            row["moment"],
+            row["metric"],
+            output_dirs["figures_hypotheses"],
+            cfg,
         )
 
-    print(f"Pipeline terminé. Résultats : {output_dirs['root']}")
+    print(
+        "Pipeline terminé. Résultats : "
+        f"{output_dirs['root']}"
+    )
 
 
 if __name__ == "__main__":
@@ -427,7 +465,7 @@ if __name__ == "__main__":
         type=Path,
         default=None,
         help=(
-            "Dossier output final. "
+            "Dossier de sortie. "
             "Par défaut : <data_root>/output"
         ),
     )
@@ -436,12 +474,10 @@ if __name__ == "__main__":
 
     data_root = args.data_root.resolve()
 
-    if args.output_dir is None:
-        output_root = data_root / "output"
-    else:
-        output_root = args.output_dir.resolve()
-
-    main(
-        data_root=data_root,
-        output_root=output_root,
+    output_root = (
+        args.output_dir.resolve()
+        if args.output_dir is not None
+        else data_root / "output"
     )
+
+    main(data_root, output_root)

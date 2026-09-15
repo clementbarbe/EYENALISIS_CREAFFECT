@@ -1,4 +1,4 @@
-"""Synchronisation comportementale et EyeLink."""
+"""Synchronisation comportementale ↔ EyeLink."""
 
 from __future__ import annotations
 
@@ -30,10 +30,7 @@ def synchronize_run(
     cfg: Config,
 ) -> SyncResult:
     """
-    Synchronise le CSV et l'ASC via le premier BUTTON <ts> 1 1.
-
-    Formula:
-        offset_ms = first_button_ms - t0_fMRI * 1000
+    Synchronise le comportement avec l'ASC via le premier BUTTON 1 1.
     """
     if "t0_fMRI" not in timing.index or pd.isna(timing["t0_fMRI"]):
         return SyncResult(
@@ -80,12 +77,15 @@ def synchronize_run(
             float(timing["t_run_end"]) - t0_fmri_s
         ) * 1000.0
 
-        end_difference_s = abs(asc_end_ms - expected_end_ms) / 1000.0
+        end_difference_s = abs(
+            asc_end_ms - expected_end_ms
+        ) / 1000.0
 
-        if end_difference_s <= cfg.max_sync_end_difference_s:
-            quality_flag = "good"
-        else:
-            quality_flag = "poor_end_consistency"
+        quality_flag = (
+            "good"
+            if end_difference_s <= cfg.max_sync_end_difference_s
+            else "poor_end_consistency"
+        )
 
     return SyncResult(
         success=True,
@@ -102,7 +102,7 @@ def behavioral_to_eyelink_ms(
     timing: pd.Series,
     sync: SyncResult,
 ) -> float:
-    """Convertit un temps comportemental relatif en temps EyeLink."""
+    """Convertit un temps comportemental relatif vers EyeLink."""
     if not sync.success or sync.first_button_ms is None:
         return np.nan
 
@@ -111,5 +111,8 @@ def behavioral_to_eyelink_ms(
 
     return float(
         sync.first_button_ms
-        + (float(behavioral_time_s) - float(timing["t0_fMRI"])) * 1000.0
+        + (
+            float(behavioral_time_s)
+            - float(timing["t0_fMRI"])
+        ) * 1000.0
     )

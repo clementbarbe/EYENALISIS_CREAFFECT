@@ -1,4 +1,4 @@
-"""Modèles mixtes exploratoires robustes et correction FDR."""
+"""Analyses statistiques : blocs d'induction, modèles mixtes et FDR."""
 
 from __future__ import annotations
 
@@ -18,26 +18,90 @@ GROUP_SCHEMES = {
     "arousal": "group_arousal",
 }
 
+# Métriques participant à l'analyse pupillométrique principale et à la FDR.
+PRIMARY_PUPIL_METRICS = {
+    "pupil_mean",
+    "pupil_sd",
+    "pupil_baseline_corrected",
+    "pupil_slope_per_s",
+    "pupil_auc",
+    "pupil_peak",
+    "pupil_peak_latency_s",
+}
+
+
+def aggregate_to_induction_blocks(
+    metrics_long: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Agrège les essais en blocs d'induction.
+
+    Les moments M2/M3 sont présents sur les trois essais d'un bloc.
+    Ils sont moyennés avant l'analyse afin de ne pas considérer les trois
+    essais partageant une même induction comme indépendants.
+    """
+    valid = metrics_long.loc[
+        metrics_long["moment_valid"]
+        & metrics_long["value"].notna()
+    ].copy()
+
+    grouping_columns = [
+        "subject_id",
+        "run_id",
+        "induction_block_id",
+        "moment",
+        "metric",
+        "group_5cat",
+        "group_valence",
+        "group_arousal",
+    ]
+
+    aggregation = {
+        "value": "mean",
+        "trial_n": "count",
+        "missing_fraction_window": "mean",
+        "actual_duration_s": "mean",
+        "emo_grid_valence": "mean",
+        "emo_grid_arousal": "mean",
+        "LTask_rating": "mean",
+    }
+
+    block_data = (
+        valid.groupby(
+            grouping_columns,
+            as_index=False,
+            dropna=False,
+        )
+        .agg(aggregation)
+        .rename(
+            columns={
+                "value": "value_block_mean",
+                "trial_n": "n_valid_trials_in_block",
+                "missing_fraction_window": "mean_missing_fraction",
+                "actual_duration_s": "mean_window_duration_s",
+            }
+        )
+    )
+
+    block_data["value"] = block_data["value_block_mean"]
+
+    return block_data
+
 
 def _count_subjects_with_multiple_levels(
     data: pd.DataFrame,
-    group_col: str,
+    group_column: str,
 ) -> int:
-    """Compte les sujets possédant au moins deux niveaux de groupe."""
-    levels_per_subject = data.groupby("subject_id")[group_col].nunique()
-    return int((levels_per_subject >= 2).sum())
+    """Compte les sujets ayant au moins deux niveaux de condition."""
+    levels = data.groupby("subject_id")[group_column].nunique()
+    return int((levels >= 2).sum())
 
 
 def _fit_mixedlm_with_retries(
     formula: str,
     data: pd.DataFrame,
 ) -> tuple[object | None, list[str], str | None]:
-    """
-    Ajuste MixedLM avec plusieurs optimiseurs.
-
-    Les warnings retournés correspondent uniquement au modèle retenu,
-    pas aux essais précédents échoués.
-    """
+    """Ajuste MixedLM avec plusieurs optimiseurs."""
     optimizers = ["lbfgs", "bfgs", "cg", "powell"]
 
     for optimizer in optimizers:
@@ -55,14 +119,14 @@ def _fit_mixedlm_with_retries(
                 fit = model.fit(
                     reml=False,
                     method=optimizer,
-                    disp=False,
                     maxiter=500,
+                    disp=False,
                 )
 
-            warning_messages = [str(w.message) for w in caught]
+            messages = [str(w.message) for w in caught]
 
             if bool(fit.converged):
-                return fit, warning_messages, optimizer
+                return fit, messages, optimizer
 
         except Exception:
             continue
@@ -70,9 +134,11 @@ def _fit_mixedlm_with_retries(
     return None, [], None
 
 
-def _has_critical_warning(warning_messages: list[str]) -> bool:
-    """Détermine si les warnings invalident les p-values Wald."""
-    critical_patterns = [
+def _has_critical_warning(
+    warning_messages: list[str],
+) -> bool:
+    """Détecte les warnings invalidant les p-values Wald."""
+    critical = [
         "Hessian matrix at the estimated parameter values is not positive definite",
         "Maximum Likelihood optimization failed to converge",
         "MixedLM optimization failed",
@@ -80,7 +146,7 @@ def _has_critical_warning(warning_messages: list[str]) -> bool:
     ]
 
     return any(
-        any(pattern.lower() in message.lower() for pattern in critical_patterns)
+        any(pattern.lower() in message.lower() for pattern in critical)
         for message in warning_messages
     )
 
@@ -89,7 +155,7 @@ def _is_singular_random_effect(
     fit: object,
     tolerance: float = 1e-8,
 ) -> bool:
-    """Indique si la variance aléatoire sujet est quasi nulle."""
+    """Indique si la variance aléatoire sujet est proche de zéro."""
     try:
         covariance = np.asarray(fit.cov_re, dtype=float)
 
@@ -112,42 +178,52 @@ def fit_mixed_models(
     cfg: Config,
 ) -> pd.DataFrame:
     """
-    Ajuste un modèle mixte pour chaque schéma x moment x métrique.
+    Ajuste un modèle mixte par schéma x moment x métrique.
 
-    Modèle:
-        value_z ~ C(group) + C(run_id) + (1 | subject_id)
+    Modèle :
+        value_z ~ C(condition) + C(run_id) + (1 | subject_id)
 
-    La standardisation est seulement utilisée pour la stabilité numérique.
-    Les tailles d'effet sont exprimées en unités d'écart-type.
+    Les données sont analysées au niveau bloc d'induction.
     """
     results: list[dict] = []
 
-    valid = metrics_long.loc[
-        metrics_long["moment_valid"]
-        & metrics_long["value"].notna()
+    block_metrics = aggregate_to_induction_blocks(metrics_long)
+
+    valid = block_metrics.loc[
+        block_metrics["metric"].isin(PRIMARY_PUPIL_METRICS)
+        & block_metrics["value"].notna()
     ].copy()
 
-    for scheme_name, group_col in GROUP_SCHEMES.items():
-        for (moment, metric), data in valid.groupby(["moment", "metric"]):
+    for scheme_name, group_column in GROUP_SCHEMES.items():
+        for (moment, metric), data in valid.groupby(
+            ["moment", "metric"]
+        ):
             data = data.dropna(
-                subset=["subject_id", "run_id", group_col, "value"]
+                subset=[
+                    "subject_id",
+                    "run_id",
+                    group_column,
+                    "value",
+                ]
             ).copy()
 
             n_rows = len(data)
             n_subjects = data["subject_id"].nunique()
-            n_levels = data[group_col].nunique()
+            n_levels = data[group_column].nunique()
 
-            n_subjects_multilevel = _count_subjects_with_multiple_levels(
-                data,
-                group_col,
+            n_subjects_multilevel = (
+                _count_subjects_with_multiple_levels(
+                    data,
+                    group_column,
+                )
             )
 
             base = {
                 "scheme": scheme_name,
-                "group_column": group_col,
+                "group_column": group_column,
                 "moment": moment,
                 "metric": metric,
-                "n_rows": n_rows,
+                "n_induction_blocks": n_rows,
                 "n_subjects": n_subjects,
                 "n_levels": n_levels,
                 "n_subjects_with_multiple_group_levels": n_subjects_multilevel,
@@ -162,13 +238,12 @@ def fit_mixed_models(
                 "ci_low_std": np.nan,
                 "ci_high_std": np.nan,
                 "aic": np.nan,
-                "n_obs": np.nan,
                 "warning_messages": "",
                 "error": "",
             }
 
             if n_rows < cfg.min_rows_for_model:
-                base["error"] = "insufficient_rows"
+                base["error"] = "insufficient_induction_blocks"
                 results.append(base)
                 continue
 
@@ -198,36 +273,32 @@ def fit_mixed_models(
                 data["value"] - data["value"].mean()
             ) / value_sd
 
-            formula = f"value_z ~ C({group_col}) + C(run_id)"
+            formula = (
+                f"value_z ~ C({group_column}) + C(run_id)"
+            )
 
-            fit, warning_messages, optimizer = _fit_mixedlm_with_retries(
-                formula=formula,
-                data=data,
+            fit, messages, optimizer = _fit_mixedlm_with_retries(
+                formula,
+                data,
             )
 
             base["optimizer"] = optimizer or ""
-            base["warning_messages"] = " | ".join(warning_messages)
+            base["warning_messages"] = " | ".join(messages)
 
             if fit is None:
                 base["error"] = "mixedlm_failed_to_converge"
                 results.append(base)
                 continue
 
-            if _has_critical_warning(warning_messages):
+            if _has_critical_warning(messages):
                 base["error"] = "unreliable_hessian_or_convergence_warning"
-                results.append(base)
-                continue
-
-            if not bool(fit.converged):
-                base["error"] = "fit_not_converged"
                 results.append(base)
                 continue
 
             try:
                 group_terms = [
-                    name
-                    for name in fit.params.index
-                    if name.startswith(f"C({group_col})")
+                    term for term in fit.params.index
+                    if term.startswith(f"C({group_column})")
                 ]
 
                 if not group_terms:
@@ -240,20 +311,22 @@ def fit_mixed_models(
                     for term in group_terms
                 ]
 
-                restriction_matrix = np.zeros(
+                restriction = np.zeros(
                     (len(parameter_indices), len(fit.params))
                 )
 
-                for row_index, parameter_index in enumerate(parameter_indices):
-                    restriction_matrix[row_index, parameter_index] = 1.0
+                for row_index, parameter_index in enumerate(
+                    parameter_indices
+                ):
+                    restriction[row_index, parameter_index] = 1.0
 
                 try:
                     wald = fit.wald_test(
-                        restriction_matrix,
+                        restriction,
                         scalar=True,
                     )
                 except TypeError:
-                    wald = fit.wald_test(restriction_matrix)
+                    wald = fit.wald_test(restriction)
 
                 p_raw = float(np.asarray(wald.pvalue).squeeze())
 
@@ -261,21 +334,24 @@ def fit_mixed_models(
                 standard_errors = fit.bse[group_terms]
 
                 strongest_term = parameters.abs().idxmax()
-                estimate_z = float(parameters[strongest_term])
-                se_z = float(standard_errors[strongest_term])
+                estimate = float(parameters[strongest_term])
+                standard_error = float(
+                    standard_errors[strongest_term]
+                )
 
                 base.update(
                     {
                         "model_success": True,
                         "model_reliable": True,
-                        "random_effect_singular": _is_singular_random_effect(fit),
+                        "random_effect_singular": (
+                            _is_singular_random_effect(fit)
+                        ),
                         "p_raw": p_raw,
                         "strongest_contrast": strongest_term,
-                        "effect_size_std_max_contrast": estimate_z,
-                        "ci_low_std": estimate_z - 1.96 * se_z,
-                        "ci_high_std": estimate_z + 1.96 * se_z,
+                        "effect_size_std_max_contrast": estimate,
+                        "ci_low_std": estimate - 1.96 * standard_error,
+                        "ci_high_std": estimate + 1.96 * standard_error,
                         "aic": float(fit.aic),
-                        "n_obs": int(fit.nobs),
                     }
                 )
 
@@ -288,14 +364,15 @@ def fit_mixed_models(
 
             results.append(base)
 
-    result_df = pd.DataFrame(results)
+    results_df = pd.DataFrame(results)
 
-    if result_df.empty:
-        return result_df
+    if results_df.empty:
+        return results_df
 
-    # FDR par schéma : 5 catégories / valence / arousal.
-    for _, indices in result_df.groupby("scheme").groups.items():
-        subset = result_df.loc[indices].copy()
+    # Une correction FDR indépendante par schéma :
+    # cinq catégories, valence, arousal.
+    for _, indices in results_df.groupby("scheme").groups.items():
+        subset = results_df.loc[indices].copy()
 
         eligible = (
             subset["model_success"]
@@ -306,7 +383,7 @@ def fit_mixed_models(
         if not eligible.any():
             continue
 
-        rejected, corrected_pvalues, _, _ = multipletests(
+        rejected, p_corrected, _, _ = multipletests(
             subset.loc[eligible, "p_raw"].to_numpy(),
             alpha=cfg.alpha,
             method=cfg.fdr_method,
@@ -314,7 +391,10 @@ def fit_mixed_models(
 
         eligible_indices = subset.loc[eligible].index
 
-        result_df.loc[eligible_indices, "p_fdr"] = corrected_pvalues
-        result_df.loc[eligible_indices, "significant_fdr"] = rejected
+        results_df.loc[eligible_indices, "p_fdr"] = p_corrected
+        results_df.loc[
+            eligible_indices,
+            "significant_fdr",
+        ] = rejected
 
-    return result_df
+    return results_df

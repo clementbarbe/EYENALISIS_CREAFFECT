@@ -34,12 +34,18 @@ def _to_bool(series: pd.Series) -> pd.Series:
     )
 
 
-def _convert_numeric_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    """Convertit les colonnes existantes en numérique."""
+def _convert_numeric_columns(
+    dataframe: pd.DataFrame,
+    columns: list[str],
+) -> pd.DataFrame:
+    """Convertit les colonnes existantes en valeurs numériques."""
     for column in columns:
-        if column in df.columns:
-            df[column] = pd.to_numeric(df[column], errors="coerce")
-    return df
+        if column in dataframe.columns:
+            dataframe[column] = pd.to_numeric(
+                dataframe[column],
+                errors="coerce",
+            )
+    return dataframe
 
 
 def parse_behavior_csv(
@@ -48,29 +54,35 @@ def parse_behavior_csv(
     run_id: int,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """
-    Charge un CSV comportemental.
+    Charge un fichier comportemental.
 
     Returns
     -------
     trials:
-        Une ligne par essai FGAT_Dist avec catégories propagées.
+        Une ligne par essai FGAT_Dist avec catégorie propagée au bloc.
     timing:
-        Ligne TIMING unique du run.
+        Ligne TIMING du run.
     """
     raw = pd.read_csv(csv_path)
 
     if "task" not in raw.columns:
-        raise ValueError(f"Colonne task absente dans {csv_path}")
+        raise ValueError(f"Colonne 'task' absente : {csv_path}")
 
-    timing_df = raw.loc[raw["task"].astype(str) == "TIMING"].copy()
-    if timing_df.empty:
-        raise ValueError(f"Ligne TIMING absente dans {csv_path}")
+    timing_rows = raw.loc[
+        raw["task"].astype(str) == "TIMING"
+    ].copy()
 
-    timing = timing_df.iloc[0]
+    if timing_rows.empty:
+        raise ValueError(f"Ligne TIMING absente : {csv_path}")
 
-    trials = raw.loc[raw["task"].astype(str) == "FGAT_Dist"].copy()
+    timing = timing_rows.iloc[0]
+
+    trials = raw.loc[
+        raw["task"].astype(str) == "FGAT_Dist"
+    ].copy()
+
     if trials.empty:
-        raise ValueError(f"Aucun essai FGAT_Dist dans {csv_path}")
+        raise ValueError(f"Aucun essai FGAT_Dist : {csv_path}")
 
     required_columns = [
         "trial_n",
@@ -85,9 +97,15 @@ def parse_behavior_csv(
         "is_resumed",
     ]
 
-    missing_columns = [c for c in required_columns if c not in trials.columns]
+    missing_columns = [
+        column for column in required_columns
+        if column not in trials.columns
+    ]
+
     if missing_columns:
-        raise ValueError(f"Colonnes manquantes dans {csv_path}: {missing_columns}")
+        raise ValueError(
+            f"Colonnes manquantes dans {csv_path}: {missing_columns}"
+        )
 
     numeric_columns = [
         "trial_n",
@@ -113,10 +131,12 @@ def parse_behavior_csv(
     trials["timeout"] = _to_bool(trials["timeout"])
     trials["is_resumed"] = _to_bool(trials["is_resumed"])
 
-    # Les blocs sont 0-2, 3-5, 6-8, 9-11, 12-14.
-    trials["induction_block_id"] = (trials["trial_n"] // 3).astype("Int64")
+    # Blocs : 0-2, 3-5, 6-8, 9-11, 12-14.
+    trials["induction_block_id"] = (
+        trials["trial_n"] // 3
+    ).astype("Int64")
 
-    induction_values = (
+    block_values = (
         trials.loc[trials["has_induction"]]
         .groupby("induction_block_id", dropna=False)
         [
@@ -139,21 +159,24 @@ def parse_behavior_csv(
     )
 
     trials = trials.merge(
-        induction_values,
+        block_values,
         on="induction_block_id",
         how="left",
         validate="many_to_one",
     )
 
-    # Propagation aux trois essais du bloc.
     trials["stim_category"] = trials["block_stim_category"]
     trials["emo_stim_onset"] = trials["block_emo_stim_onset"]
     trials["emo_grid_valence"] = trials["block_emo_grid_valence"]
     trials["emo_grid_arousal"] = trials["block_emo_grid_arousal"]
 
     trials["group_5cat"] = trials["stim_category"]
-    trials["group_valence"] = trials["stim_category"].map(CATEGORY_TO_VALENCE)
-    trials["group_arousal"] = trials["stim_category"].map(CATEGORY_TO_AROUSAL)
+    trials["group_valence"] = trials["stim_category"].map(
+        CATEGORY_TO_VALENCE
+    )
+    trials["group_arousal"] = trials["stim_category"].map(
+        CATEGORY_TO_AROUSAL
+    )
 
     trials["subject_id"] = subject_id
     trials["run_id"] = run_id
