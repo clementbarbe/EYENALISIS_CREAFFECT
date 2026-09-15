@@ -4,126 +4,120 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict
 
 
 @dataclass(frozen=True)
 class Config:
-    """Paramètres globaux, modifiables sans toucher aux modules."""
+    """Paramètres modifiables du pipeline."""
 
-    # -----------------------------
-    # Sorties
-    # -----------------------------
-    output_dir_name: str = "output"
-    figures_dir_name: str = "figures"
-    tables_dir_name: str = "tables"
-    logs_dir_name: str = "logs"
-
-    # Produire également des figures pour les hypothèses non estimables :
-    # elles porteront l'annotation "modèle non estimable" ou la raison.
-    plot_non_estimable_hypotheses: bool = True
-
-    # -----------------------------
-    # Acquisition
-    # -----------------------------
+    # ------------------------------------------------------------------
+    # Acquisition EyeLink
+    # ------------------------------------------------------------------
     sampling_rate_hz: float = 1000.0
     eye: str = "R"
 
-    # -----------------------------
+    # ------------------------------------------------------------------
     # Synchronisation
-    # -----------------------------
+    # ------------------------------------------------------------------
     sync_button_code: int = 1
     sync_button_state: int = 1
+
+    # Contrôle secondaire de cohérence temporelle.
     max_sync_end_difference_s: float = 10.0
+
+    # False recommandé : le contrôle de fin est informatif, mais il ne faut
+    # pas exclure automatiquement avant validation du format réel des ASC.
     exclude_bad_sync_end_check: bool = False
 
-    # -----------------------------
+    # ------------------------------------------------------------------
     # Prétraitement pupillaire
-    # -----------------------------
+    # ------------------------------------------------------------------
     blink_padding_before_ms: int = 100
     blink_padding_after_ms: int = 100
 
-    # Si SBLINK/EBLINK absents : détection défensive complémentaire
-    pupil_drop_mad_threshold: float = 8.0
+    # Valeur minimale plausible pour la pupille.
+    min_plausible_pupil: float = 0.01
+
+    # Seuil MAD pour les valeurs aberrantes de pupille.
     pupil_outlier_mad_threshold: float = 6.0
 
+    # Interpolation des trous courts uniquement.
     interpolation_max_gap_ms: int = 500
 
+    # Filtre passe-bas Butterworth.
     lowpass_enabled: bool = True
     lowpass_cutoff_hz: float = 6.0
     lowpass_order: int = 4
 
-    min_plausible_pupil: float = 0.01
+    # Signal considéré comme anormalement constant sous ce seuil.
     min_unique_pupil_values: int = 20
 
-    # -----------------------------
+    # ------------------------------------------------------------------
     # Exclusions
-    # -----------------------------
-    # Valeur confirmée : un run est exclu au-delà de 20%.
+    # ------------------------------------------------------------------
+    # Valeur confirmée dans le brief : >20 % => run exclu.
     max_run_missing_fraction: float = 0.20
+
+    # Exclusion d'une fenêtre essai x moment.
     max_moment_missing_fraction: float = 0.25
+
+    # Run exclu si moins de 50 % des essais possèdent au moins un moment valide.
     min_valid_trial_fraction_per_run: float = 0.50
+
+    # Sujet exclu si moins de 3 runs expérimentaux valides.
     min_valid_runs_per_subject: int = 3
 
-    # -----------------------------
+    # ------------------------------------------------------------------
     # Fenêtres temporelles
-    # -----------------------------
-    dynamic_window_default_s: float = 2.0
-    moment_window_s: Dict[str, float] = field(default_factory=lambda: {
+    # ------------------------------------------------------------------
+    induction_duration_s: float = 10.0
+
+    moment_window_s: dict[str, float] = field(default_factory=lambda: {
         "M2a_search_start": 2.0,
         "M2b_search_end": 2.0,
         "M3a_rating_start": 2.0,
         "M3b_rating_end": 2.0,
     })
 
-    induction_duration_s: float = 10.0
     minimum_usable_window_s: float = 0.5
 
-    # Les CSV ne fournissent pas explicitement l'onset de chaque croix.
-    # La baseline est donc une approximation : N dernières ms avant l'onset
-    # du moment. Si des timestamps de croix deviennent disponibles, remplacer
-    # cette stratégie dans moments.py.
+    # Baseline provisoire : 500 ms avant l'onset du moment.
+    # À remplacer par la croix précédente si ses timestamps deviennent disponibles.
     baseline_duration_s: float = 0.5
 
-    # -----------------------------
-    # Analyses statistiques
-    # -----------------------------
+    # ------------------------------------------------------------------
+    # Statistiques
+    # ------------------------------------------------------------------
     alpha: float = 0.05
     fdr_method: str = "fdr_bh"
+
     min_rows_for_model: int = 12
-    min_subjects_for_model: int = 3
+    min_subjects_for_model: int = 5
     min_levels_for_model: int = 2
 
-    # -----------------------------
-    # Visualisation
-    # -----------------------------
+    # ------------------------------------------------------------------
+    # Figures
+    # ------------------------------------------------------------------
     dpi: int = 160
-    temporal_curve_window_s: float = 2.0
-    temporal_curve_bin_ms: int = 50
+
+    # Si True, produit aussi les graphiques descriptifs lorsque le modèle
+    # est non estimable/non fiable.
+    plot_non_estimable_hypotheses: bool = True
 
 
 DEFAULT_CONFIG = Config()
 
 
-def make_output_dirs(output_root: Path, cfg: Config) -> dict[str, Path]:
-    """
-    Crée et retourne une arborescence de sortie structurée.
-
-    Parameters
-    ----------
-    output_root:
-        Dossier parent où le dossier output sera créé.
-    """
-    out = output_root / cfg.output_dir_name
-
+def make_output_dirs(output_root: Path) -> dict[str, Path]:
+    """Crée l'arborescence de sortie."""
     paths = {
-        "root": out,
-        "figures": out / cfg.figures_dir_name,
-        "tables": out / cfg.tables_dir_name,
-        "logs": out / cfg.logs_dir_name,
-        "figures_exclusion": out / cfg.figures_dir_name / "exclusion",
-        "figures_heatmaps": out / cfg.figures_dir_name / "heatmaps",
-        "figures_hypotheses": out / cfg.figures_dir_name / "hypotheses",
+        "root": output_root,
+        "tables": output_root / "tables",
+        "logs": output_root / "logs",
+        "figures": output_root / "figures",
+        "figures_exclusion": output_root / "figures" / "exclusion",
+        "figures_heatmaps": output_root / "figures" / "heatmaps",
+        "figures_hypotheses": output_root / "figures" / "hypotheses",
     }
 
     for path in paths.values():

@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 import statsmodels.formula.api as smf
 from statsmodels.stats.multitest import multipletests
-from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
 from config import Config
 
@@ -24,13 +23,7 @@ def _count_subjects_with_multiple_levels(
     data: pd.DataFrame,
     group_col: str,
 ) -> int:
-    """
-    Nombre de sujets ayant au moins deux niveaux du facteur de groupe.
-
-    Un effet de catégorie dans un modèle à intercept aléatoire sujet est
-    beaucoup plus informatif si les comparaisons existent effectivement
-    à l'intérieur des sujets.
-    """
+    """Compte les sujets possédant au moins deux niveaux de groupe."""
     levels_per_subject = data.groupby("subject_id")[group_col].nunique()
     return int((levels_per_subject >= 2).sum())
 
@@ -40,19 +33,12 @@ def _fit_mixedlm_with_retries(
     data: pd.DataFrame,
 ) -> tuple[object | None, list[str], str | None]:
     """
-    Ajuste un MixedLM avec plusieurs optimiseurs.
+    Ajuste MixedLM avec plusieurs optimiseurs.
 
-    Returns
-    -------
-    fit:
-        Résultat Statsmodels ou None si tous les essais échouent.
-    warning_messages:
-        Liste des warnings capturés pendant l'ajustement.
-    optimizer_used:
-        Optimiseur ayant produit le résultat retenu.
+    Les warnings retournés correspondent uniquement au modèle retenu,
+    pas aux essais précédents échoués.
     """
     optimizers = ["lbfgs", "bfgs", "cg", "powell"]
-    all_warning_messages: list[str] = []
 
     for optimizer in optimizers:
         try:
@@ -73,31 +59,19 @@ def _fit_mixedlm_with_retries(
                     maxiter=500,
                 )
 
-            current_warnings = [str(w.message) for w in caught]
-            all_warning_messages.extend(current_warnings)
+            warning_messages = [str(w.message) for w in caught]
 
             if bool(fit.converged):
-                return fit, all_warning_messages, optimizer
+                return fit, warning_messages, optimizer
 
-        except Exception as exc:
-            all_warning_messages.append(
-                f"{optimizer}: {type(exc).__name__}: {exc}"
-            )
+        except Exception:
+            continue
 
-    return None, all_warning_messages, None
+    return None, [], None
 
 
-def _has_unreliable_hessian_or_convergence_warning(
-    warning_messages: list[str],
-) -> bool:
-    """
-    Détermine si les warnings invalident l'inférence Wald.
-
-    Une covariance singulière seule est conservée comme drapeau de QC :
-    elle peut indiquer une variance inter-sujet estimée à zéro.
-    En revanche, Hessienne non positive définie ou absence de convergence
-    invalident les SE/p-values et entraînent l'exclusion du modèle.
-    """
+def _has_critical_warning(warning_messages: list[str]) -> bool:
+    """Détermine si les warnings invalident les p-values Wald."""
     critical_patterns = [
         "Hessian matrix at the estimated parameter values is not positive definite",
         "Maximum Likelihood optimization failed to converge",
@@ -111,41 +85,40 @@ def _has_unreliable_hessian_or_convergence_warning(
     )
 
 
-def _is_singular_random_effect(fit: object, tolerance: float = 1e-8) -> bool:
-    """
-    Indique si la variance de l'intercept aléatoire est quasi nulle.
-
-    Ce statut est rapporté en QC mais n'invalide pas systématiquement le modèle
-    si celui-ci a convergé sans problème de Hessienne.
-    """
+def _is_singular_random_effect(
+    fit: object,
+    tolerance: float = 1e-8,
+) -> bool:
+    """Indique si la variance aléatoire sujet est quasi nulle."""
     try:
         covariance = np.asarray(fit.cov_re, dtype=float)
+
         if covariance.size == 0:
             return True
 
         diagonal = np.diag(covariance)
-        return bool(np.any(~np.isfinite(diagonal)) or np.any(diagonal < tolerance))
+
+        return bool(
+            np.any(~np.isfinite(diagonal))
+            or np.any(diagonal < tolerance)
+        )
 
     except Exception:
         return True
 
 
-def fit_mixed_models(metrics_long: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+def fit_mixed_models(
+    metrics_long: pd.DataFrame,
+    cfg: Config,
+) -> pd.DataFrame:
     """
     Ajuste un modèle mixte pour chaque schéma x moment x métrique.
 
-    Modèle principal :
-        standardized_value ~ C(group) + C(run_id) + (1 | subject_id)
+    Modèle:
+        value_z ~ C(group) + C(run_id) + (1 | subject_id)
 
-    Notes
-    -----
-    - La standardisation est effectuée séparément pour chaque combinaison
-      moment x métrique x schéma, uniquement pour améliorer la stabilité
-      numérique de l'optimisation.
-    - Les p-values reportées correspondent au test Wald global du facteur
-      de groupe.
-    - Les modèles avec Hessienne non positive définie ou non-convergence
-      sont marqués invalides : aucune p-value ne leur est attribuée.
+    La standardisation est seulement utilisée pour la stabilité numérique.
+    Les tailles d'effet sont exprimées en unités d'écart-type.
     """
     results: list[dict] = []
 
@@ -163,6 +136,7 @@ def fit_mixed_models(metrics_long: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             n_rows = len(data)
             n_subjects = data["subject_id"].nunique()
             n_levels = data[group_col].nunique()
+
             n_subjects_multilevel = _count_subjects_with_multiple_levels(
                 data,
                 group_col,
@@ -193,7 +167,6 @@ def fit_mixed_models(metrics_long: pd.DataFrame, cfg: Config) -> pd.DataFrame:
                 "error": "",
             }
 
-            # Critères minimaux avant de lancer un modèle.
             if n_rows < cfg.min_rows_for_model:
                 base["error"] = "insufficient_rows"
                 results.append(base)
@@ -209,26 +182,22 @@ def fit_mixed_models(metrics_long: pd.DataFrame, cfg: Config) -> pd.DataFrame:
                 results.append(base)
                 continue
 
-            # Recommandé : ne pas interpréter une comparaison qui n'existe
-            # presque jamais intra-sujet.
             if n_subjects_multilevel < 2:
                 base["error"] = "insufficient_within_subject_group_variation"
                 results.append(base)
                 continue
 
-            # Une métrique constante rend le modèle non identifiable.
             value_sd = float(data["value"].std(ddof=1))
+
             if not np.isfinite(value_sd) or value_sd <= 1e-12:
                 base["error"] = "near_constant_metric"
                 results.append(base)
                 continue
 
-            # Standardisation pour optimiser numériquement le MixedLM.
             data["value_z"] = (
                 data["value"] - data["value"].mean()
             ) / value_sd
 
-            # C(run_id) est conservé comme covariable de contrôle.
             formula = f"value_z ~ C({group_col}) + C(run_id)"
 
             fit, warning_messages, optimizer = _fit_mixedlm_with_retries(
@@ -244,7 +213,7 @@ def fit_mixed_models(metrics_long: pd.DataFrame, cfg: Config) -> pd.DataFrame:
                 results.append(base)
                 continue
 
-            if _has_unreliable_hessian_or_convergence_warning(warning_messages):
+            if _has_critical_warning(warning_messages):
                 base["error"] = "unreliable_hessian_or_convergence_warning"
                 results.append(base)
                 continue
@@ -275,37 +244,45 @@ def fit_mixed_models(metrics_long: pd.DataFrame, cfg: Config) -> pd.DataFrame:
                     (len(parameter_indices), len(fit.params))
                 )
 
-                for row_idx, parameter_idx in enumerate(parameter_indices):
-                    restriction_matrix[row_idx, parameter_idx] = 1.0
+                for row_index, parameter_index in enumerate(parameter_indices):
+                    restriction_matrix[row_index, parameter_index] = 1.0
 
-                # scalar=True évite le FutureWarning Statsmodels.
-                wald = fit.wald_test(restriction_matrix, scalar=True)
-                p_raw = float(wald.pvalue)
+                try:
+                    wald = fit.wald_test(
+                        restriction_matrix,
+                        scalar=True,
+                    )
+                except TypeError:
+                    wald = fit.wald_test(restriction_matrix)
 
-                params = fit.params[group_terms]
-                ses = fit.bse[group_terms]
+                p_raw = float(np.asarray(wald.pvalue).squeeze())
 
-                strongest_term = params.abs().idxmax()
-                estimate_z = float(params[strongest_term])
-                se_z = float(ses[strongest_term])
+                parameters = fit.params[group_terms]
+                standard_errors = fit.bse[group_terms]
 
-                base.update({
-                    "model_success": True,
-                    "model_reliable": True,
-                    "random_effect_singular": _is_singular_random_effect(fit),
-                    "p_raw": p_raw,
-                    "strongest_contrast": strongest_term,
-                    # Comme la variable dépendante est standardisée,
-                    # le contraste est directement une taille d'effet standardisée.
-                    "effect_size_std_max_contrast": estimate_z,
-                    "ci_low_std": estimate_z - 1.96 * se_z,
-                    "ci_high_std": estimate_z + 1.96 * se_z,
-                    "aic": float(fit.aic),
-                    "n_obs": int(fit.nobs),
-                })
+                strongest_term = parameters.abs().idxmax()
+                estimate_z = float(parameters[strongest_term])
+                se_z = float(standard_errors[strongest_term])
+
+                base.update(
+                    {
+                        "model_success": True,
+                        "model_reliable": True,
+                        "random_effect_singular": _is_singular_random_effect(fit),
+                        "p_raw": p_raw,
+                        "strongest_contrast": strongest_term,
+                        "effect_size_std_max_contrast": estimate_z,
+                        "ci_low_std": estimate_z - 1.96 * se_z,
+                        "ci_high_std": estimate_z + 1.96 * se_z,
+                        "aic": float(fit.aic),
+                        "n_obs": int(fit.nobs),
+                    }
+                )
 
             except Exception as exc:
-                base["error"] = f"post_fit_error: {type(exc).__name__}: {exc}"
+                base["error"] = (
+                    f"post_fit_error: {type(exc).__name__}: {exc}"
+                )
                 base["model_success"] = False
                 base["model_reliable"] = False
 
@@ -316,8 +293,8 @@ def fit_mixed_models(metrics_long: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     if result_df.empty:
         return result_df
 
-    # Correction FDR : une famille par schéma de comparaison.
-    for scheme_name, indices in result_df.groupby("scheme").groups.items():
+    # FDR par schéma : 5 catégories / valence / arousal.
+    for _, indices in result_df.groupby("scheme").groups.items():
         subset = result_df.loc[indices].copy()
 
         eligible = (
@@ -329,14 +306,15 @@ def fit_mixed_models(metrics_long: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         if not eligible.any():
             continue
 
-        rejected, corrected, _, _ = multipletests(
+        rejected, corrected_pvalues, _, _ = multipletests(
             subset.loc[eligible, "p_raw"].to_numpy(),
             alpha=cfg.alpha,
             method=cfg.fdr_method,
         )
 
         eligible_indices = subset.loc[eligible].index
-        result_df.loc[eligible_indices, "p_fdr"] = corrected
+
+        result_df.loc[eligible_indices, "p_fdr"] = corrected_pvalues
         result_df.loc[eligible_indices, "significant_fdr"] = rejected
 
     return result_df

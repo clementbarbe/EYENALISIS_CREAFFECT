@@ -1,4 +1,4 @@
-"""Synchronisation comportementale ↔ EyeLink."""
+"""Synchronisation comportementale et EyeLink."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from config import Config
 
 @dataclass
 class SyncResult:
-    """Résultat de la synchronisation d'un run."""
+    """Résultat de synchronisation d'un run."""
 
     success: bool
     reason: Optional[str]
@@ -29,9 +29,21 @@ def synchronize_run(
     samples: pd.DataFrame,
     cfg: Config,
 ) -> SyncResult:
-    """Calcule l'offset EyeLink à partir du premier BUTTON 1 1."""
+    """
+    Synchronise le CSV et l'ASC via le premier BUTTON <ts> 1 1.
+
+    Formula:
+        offset_ms = first_button_ms - t0_fMRI * 1000
+    """
     if "t0_fMRI" not in timing.index or pd.isna(timing["t0_fMRI"]):
-        return SyncResult(False, "missing_t0_fMRI", None, None, None, "failed")
+        return SyncResult(
+            success=False,
+            reason="missing_t0_fMRI",
+            first_button_ms=None,
+            offset_ms=None,
+            end_difference_s=None,
+            quality_flag="failed",
+        )
 
     buttons = events.loc[
         (events["event_type"] == "BUTTON")
@@ -40,25 +52,40 @@ def synchronize_run(
     ]
 
     if buttons.empty:
-        return SyncResult(False, "missing_BUTTON_1_1", None, None, None, "failed")
+        return SyncResult(
+            success=False,
+            reason="missing_BUTTON_1_1",
+            first_button_ms=None,
+            offset_ms=None,
+            end_difference_s=None,
+            quality_flag="failed",
+        )
 
     first_button_ms = float(buttons["timestamp_ms"].iloc[0])
-    offset_ms = first_button_ms - float(timing["t0_fMRI"]) * 1000.0
+    t0_fmri_s = float(timing["t0_fMRI"])
+
+    offset_ms = first_button_ms - t0_fmri_s * 1000.0
 
     end_difference_s = np.nan
-    quality = "unknown"
+    quality_flag = "unknown"
 
-    if not samples.empty and "t_run_end" in timing.index and pd.notna(timing["t_run_end"]):
+    if (
+        not samples.empty
+        and "t_run_end" in timing.index
+        and pd.notna(timing["t_run_end"])
+    ):
         asc_end_ms = float(samples["timestamp_ms"].max())
+
         expected_end_ms = first_button_ms + (
-            float(timing["t_run_end"]) - float(timing["t0_fMRI"])
+            float(timing["t_run_end"]) - t0_fmri_s
         ) * 1000.0
+
         end_difference_s = abs(asc_end_ms - expected_end_ms) / 1000.0
-        quality = (
-            "good"
-            if end_difference_s <= cfg.max_sync_end_difference_s
-            else "poor_end_consistency"
-        )
+
+        if end_difference_s <= cfg.max_sync_end_difference_s:
+            quality_flag = "good"
+        else:
+            quality_flag = "poor_end_consistency"
 
     return SyncResult(
         success=True,
@@ -66,21 +93,23 @@ def synchronize_run(
         first_button_ms=first_button_ms,
         offset_ms=offset_ms,
         end_difference_s=end_difference_s,
-        quality_flag=quality,
+        quality_flag=quality_flag,
     )
 
 
 def behavioral_to_eyelink_ms(
-    behavior_time_s: float,
-    sync: SyncResult,
+    behavioral_time_s: float,
     timing: pd.Series,
+    sync: SyncResult,
 ) -> float:
-    """Convertit un temps comportemental relatif en timestamp EyeLink."""
+    """Convertit un temps comportemental relatif en temps EyeLink."""
     if not sync.success or sync.first_button_ms is None:
         return np.nan
-    if pd.isna(behavior_time_s) or pd.isna(timing["t0_fMRI"]):
+
+    if pd.isna(behavioral_time_s) or pd.isna(timing["t0_fMRI"]):
         return np.nan
 
-    return sync.first_button_ms + (
-        float(behavior_time_s) - float(timing["t0_fMRI"])
-    ) * 1000.0
+    return float(
+        sync.first_button_ms
+        + (float(behavioral_time_s) - float(timing["t0_fMRI"])) * 1000.0
+    )

@@ -1,4 +1,4 @@
-"""Prétraitement pupillométrique : blinks, interpolation, filtrage, outliers."""
+"""Prétraitement pupillométrique."""
 
 from __future__ import annotations
 
@@ -9,105 +9,134 @@ from scipy.signal import butter, filtfilt
 from config import Config
 
 
+def _mad_outlier_mask(signal: pd.Series, threshold: float) -> np.ndarray:
+    """Détecte les valeurs aberrantes avec la MAD."""
+    valid = signal.dropna()
+
+    if valid.empty:
+        return np.zeros(len(signal), dtype=bool)
+
+    median = valid.median()
+    mad = np.median(np.abs(valid - median))
+
+    if mad <= 0 or not np.isfinite(mad):
+        return np.zeros(len(signal), dtype=bool)
+
+    robust_z = 0.6745 * (signal - median) / mad
+    return (robust_z.abs() > threshold).fillna(False).to_numpy()
+
+
 def _blink_mask_from_events(
     samples: pd.DataFrame,
     events: pd.DataFrame,
     cfg: Config,
 ) -> np.ndarray:
-    """Construit un masque de blink depuis EBLINK ou SBLINK/EBLINK disponibles."""
+    """Crée un masque de blink à partir des EBLINK."""
     mask = np.zeros(len(samples), dtype=bool)
+
     if events.empty:
         return mask
 
     blink_events = events.loc[events["event_type"] == "EBLINK"]
+
     for _, event in blink_events.iterrows():
-        start = event.get("start_ms", np.nan)
-        end = event.get("end_ms", np.nan)
-        if pd.notna(start) and pd.notna(end):
-            start -= cfg.blink_padding_before_ms
-            end += cfg.blink_padding_after_ms
-            mask |= samples["timestamp_ms"].between(start, end).to_numpy()
+        start_ms = event.get("start_ms", np.nan)
+        end_ms = event.get("end_ms", np.nan)
+
+        if pd.isna(start_ms) or pd.isna(end_ms):
+            continue
+
+        padded_start = start_ms - cfg.blink_padding_before_ms
+        padded_end = end_ms + cfg.blink_padding_after_ms
+
+        mask |= samples["timestamp_ms"].between(
+            padded_start,
+            padded_end,
+            inclusive="both",
+        ).to_numpy()
 
     return mask
-
-
-def _mad_outliers(values: pd.Series, threshold: float) -> np.ndarray:
-    """Détection robuste des outliers par MAD."""
-    valid = values.dropna()
-    if valid.empty:
-        return np.zeros(len(values), dtype=bool)
-
-    median = valid.median()
-    mad = np.median(np.abs(valid - median))
-    if mad == 0:
-        return np.zeros(len(values), dtype=bool)
-
-    robust_z = 0.6745 * (values - median) / mad
-    return (np.abs(robust_z) > threshold).fillna(False).to_numpy()
 
 
 def _interpolate_short_gaps(
     signal: pd.Series,
     max_gap_samples: int,
 ) -> pd.Series:
-    """Interpole linéairement seulement les segments NaN courts."""
-    out = signal.copy()
-    is_na = out.isna().to_numpy()
+    """Interpole les trous NaN dont la durée est inférieure au seuil."""
+    output = signal.copy()
+    missing = output.isna().to_numpy()
 
     start = 0
-    while start < len(out):
-        if not is_na[start]:
+
+    while start < len(output):
+        if not missing[start]:
             start += 1
             continue
 
         end = start
-        while end < len(out) and is_na[end]:
+        while end < len(output) and missing[end]:
             end += 1
 
-        if (end - start) <= max_gap_samples and start > 0 and end < len(out):
-            out.iloc[start:end] = np.linspace(
-                out.iloc[start - 1],
-                out.iloc[end],
-                end - start + 2,
+        gap_length = end - start
+
+        if (
+            gap_length <= max_gap_samples
+            and start > 0
+            and end < len(output)
+            and pd.notna(output.iloc[start - 1])
+            and pd.notna(output.iloc[end])
+        ):
+            output.iloc[start:end] = np.linspace(
+                output.iloc[start - 1],
+                output.iloc[end],
+                gap_length + 2,
             )[1:-1]
+
         start = end
 
-    return out
+    return output
 
 
-def _filter_contiguous_segments(signal: pd.Series, cfg: Config) -> pd.Series:
-    """Applique un Butterworth séparément sur chaque segment non-NaN."""
+def _filter_segments(signal: pd.Series, cfg: Config) -> pd.Series:
+    """Applique le filtre passe-bas séparément à chaque segment valide."""
     if not cfg.lowpass_enabled:
         return signal
 
-    out = signal.copy()
+    output = signal.copy()
+    valid = output.notna().to_numpy()
+
     nyquist = cfg.sampling_rate_hz / 2.0
+    normalized_cutoff = cfg.lowpass_cutoff_hz / nyquist
+
     b, a = butter(
         cfg.lowpass_order,
-        cfg.lowpass_cutoff_hz / nyquist,
+        normalized_cutoff,
         btype="low",
     )
 
-    valid = out.notna().to_numpy()
+    min_segment_length = 3 * max(len(a), len(b))
     start = 0
 
-    while start < len(out):
+    while start < len(output):
         if not valid[start]:
             start += 1
             continue
 
         end = start
-        while end < len(out) and valid[end]:
+        while end < len(output) and valid[end]:
             end += 1
 
-        segment = out.iloc[start:end].to_numpy(dtype=float)
-        min_length = 3 * max(len(a), len(b))
-        if len(segment) >= min_length:
-            out.iloc[start:end] = filtfilt(b, a, segment)
+        segment = output.iloc[start:end].to_numpy(dtype=float)
+
+        if len(segment) >= min_segment_length:
+            try:
+                output.iloc[start:end] = filtfilt(b, a, segment)
+            except ValueError:
+                pass
 
         start = end
 
-    return out
+    return output
 
 
 def preprocess_pupil(
@@ -116,30 +145,53 @@ def preprocess_pupil(
     cfg: Config,
 ) -> pd.DataFrame:
     """
-    Produit un signal nettoyé.
+    Nettoie le signal pupillaire.
 
-    pupil_missing_raw conserve les données invalides avant interpolation,
-    afin de calculer correctement le taux de données manquantes.
+    Colonnes produites
+    ------------------
+    pupil_missing_raw:
+        Manquant / invalide avant interpolation. Utilisé pour QC.
+    pupil_clean:
+        Signal interpolé et filtré.
+    blink_or_invalid:
+        Indique les échantillons masqués avant interpolation.
     """
     df = samples.copy().sort_values("timestamp_ms").reset_index(drop=True)
+
     if df.empty:
         return df
 
     pupil = pd.to_numeric(df["pupil_size"], errors="coerce")
-    invalid = pupil.isna() | (pupil <= cfg.min_plausible_pupil)
 
+    invalid_mask = pupil.isna() | (pupil <= cfg.min_plausible_pupil)
     blink_mask = _blink_mask_from_events(df, events, cfg)
-    pupil.loc[invalid | blink_mask] = np.nan
 
-    # Outliers bruts avant interpolation.
-    outliers = _mad_outliers(pupil, cfg.pupil_outlier_mad_threshold)
-    pupil.loc[outliers] = np.nan
+    pupil.loc[invalid_mask | blink_mask] = np.nan
+
+    outlier_mask = _mad_outlier_mask(
+        pupil,
+        cfg.pupil_outlier_mad_threshold,
+    )
+
+    pupil.loc[outlier_mask] = np.nan
 
     df["pupil_missing_raw"] = pupil.isna()
-    df["blink_or_invalid"] = invalid | blink_mask | outliers
+    df["blink_or_invalid"] = invalid_mask | blink_mask | outlier_mask
 
-    max_gap_samples = int(cfg.interpolation_max_gap_ms * cfg.sampling_rate_hz / 1000)
-    interpolated = _interpolate_short_gaps(pupil, max_gap_samples)
-    df["pupil_clean"] = _filter_contiguous_segments(interpolated, cfg)
+    max_gap_samples = int(
+        cfg.interpolation_max_gap_ms
+        * cfg.sampling_rate_hz
+        / 1000.0
+    )
+
+    pupil_interpolated = _interpolate_short_gaps(
+        pupil,
+        max_gap_samples=max_gap_samples,
+    )
+
+    df["pupil_clean"] = _filter_segments(
+        pupil_interpolated,
+        cfg,
+    )
 
     return df
