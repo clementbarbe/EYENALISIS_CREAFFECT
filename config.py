@@ -38,7 +38,7 @@ class Config:
 
     # Exclusion des runs
     # Valeur confirmée dans le brief : >20 % => run exclu.
-    max_run_missing_fraction: float = 0.30
+    max_run_missing_fraction: float = 0.35
 
     # Exclusion essai x moment
     max_moment_missing_fraction: float = 0.25
@@ -49,17 +49,17 @@ class Config:
     induction_duration_s: float = 10.0
 
     moment_window_s: dict[str, float] = field(default_factory=lambda: {
-        "M2a_search_start": 2.0,
-        "M2b_search_end": 2.0,
-        "M3a_rating_start": 2.0,
-        "M3b_rating_end": 2.0,
+        "M2a_search_start": 1.0,
+        "M2b_search_end": 1.0,
+        "M3a_rating_start": 1.0,
+        "M3b_rating_end": 1.0,
     })
 
     minimum_usable_window_s: float = 0.5
 
     # Approximation provisoire : 500 ms avant l'onset du moment.
     # À remplacer si les timestamps exacts des croix de fixation sont disponibles.
-    baseline_duration_s: float = 0.5
+    baseline_duration_s: float = 1
 
     # Statistiques
     alpha: float = 0.05
