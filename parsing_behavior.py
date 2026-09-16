@@ -54,12 +54,13 @@ def parse_behavior_csv(
     run_id: int,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """
-    Charge un fichier comportemental.
+    Charge un fichier comportemental FGAT_Dist.
 
     Returns
     -------
     trials:
-        Une ligne par essai FGAT_Dist avec catégorie propagée au bloc.
+        Une ligne par essai FGAT_Dist, avec les variables d'induction
+        propagées aux trois essais du bloc.
     timing:
         Ligne TIMING du run.
     """
@@ -111,15 +112,37 @@ def parse_behavior_csv(
         "trial_n",
         "trial_n_global",
         "asso_id",
+
+        # Croixes de fixation disponibles dans les CSV.
+        "t_onset_cross_induc",
+        "t_duration_cross_induc",
+        "t_onset_cross_cue_fgat",
+        "t_duration_cross_cue_fgat",
+        "t_onset_cross_LTask",
+        "t_duration_cross_LTask",
+
+        # Induction.
         "emo_stim_onset",
+        "emo_grid_onset",
+        "emo_grid_first_movement",
+        "emo_grid_validation",
         "emo_grid_valence",
         "emo_grid_arousal",
+
+        # Recherche associative.
         "fgat_cue_onset",
         "fgat_input_time",
+        "fgat_validate_time",
+
+        # Evaluation LTask.
         "LTask_onset",
         "LTask_first_movement",
         "LTask_validation",
         "LTask_rating",
+
+        # Divers.
+        "washout_duration",
+        "washout_onset",
     ]
 
     trials = _convert_numeric_columns(trials, numeric_columns)
@@ -131,7 +154,7 @@ def parse_behavior_csv(
     trials["timeout"] = _to_bool(trials["timeout"])
     trials["is_resumed"] = _to_bool(trials["is_resumed"])
 
-    # Blocs : 0-2, 3-5, 6-8, 9-11, 12-14.
+    # Blocs : essais 0-2, 3-5, 6-8, 9-11 et 12-14.
     trials["induction_block_id"] = (
         trials["trial_n"] // 3
     ).astype("Int64")
@@ -165,15 +188,18 @@ def parse_behavior_csv(
         validate="many_to_one",
     )
 
+    # Propagation explicite aux trois essais du bloc.
     trials["stim_category"] = trials["block_stim_category"]
     trials["emo_stim_onset"] = trials["block_emo_stim_onset"]
     trials["emo_grid_valence"] = trials["block_emo_grid_valence"]
     trials["emo_grid_arousal"] = trials["block_emo_grid_arousal"]
 
     trials["group_5cat"] = trials["stim_category"]
+
     trials["group_valence"] = trials["stim_category"].map(
         CATEGORY_TO_VALENCE
     )
+
     trials["group_arousal"] = trials["stim_category"].map(
         CATEGORY_TO_AROUSAL
     )

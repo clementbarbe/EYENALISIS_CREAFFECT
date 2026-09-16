@@ -27,14 +27,14 @@ from sync import synchronize_run
 from viz import (
     plot_distribution,
     plot_exclusion_funnel,
-    plot_fdr_heatmap,
-    plot_results_table_png,
+    plot_results_table_for_x,
     plot_run_exclusion_reasons,
+    plot_x_stability,
 )
 
 
 def discover_subjects(data_root: Path) -> list[Path]:
-    """Trouve tous les dossiers C4X###."""
+    """Trouve automatiquement tous les dossiers C4X###."""
     return sorted(
         directory
         for directory in data_root.iterdir()
@@ -73,12 +73,51 @@ def find_run_files(
     )
 
 
+def _get_run_qc_trial_fraction(
+    metrics: pd.DataFrame,
+    cfg,
+) -> float:
+    """
+    Calcule la proportion d'essais dynamiques utilisables pour la QC run.
+
+    La QC utilise une valeur X fixe (par défaut 1.0 s) afin que la décision
+    d'exclure un run ne dépende pas de la valeur X ensuite explorée.
+    """
+    dynamic_moments = [
+        "M2a_search_start",
+        "M2b_search_end",
+        "M3a_rating_start",
+        "M3b_rating_end",
+    ]
+
+    qc_rows = metrics.loc[
+        metrics["moment"].isin(dynamic_moments)
+        & np.isclose(
+            metrics["window_x_s"].astype(float),
+            cfg.run_qc_x_s,
+        )
+        & metrics["moment_valid"]
+    ].copy()
+
+    if qc_rows.empty:
+        return 0.0
+
+    valid_trials = qc_rows["trial_n"].nunique()
+
+    total_trials = metrics.loc[
+        metrics["moment"].isin(dynamic_moments),
+        "trial_n",
+    ].nunique()
+
+    return valid_trials / max(1, total_trials)
+
+
 def process_run(
     subject_dir: Path,
     subject_id: str,
     run_id: int,
 ) -> tuple[pd.DataFrame, dict]:
-    """Traite un run sans interrompre tout le pipeline."""
+    """Traite un run sans interrompre le pipeline si un run échoue."""
     cfg = DEFAULT_CONFIG
 
     csv_path, asc_path = find_run_files(
@@ -95,6 +134,7 @@ def process_run(
         "run_missing_fraction": np.nan,
         "run_unique_pupil_values": np.nan,
         "valid_trial_fraction": np.nan,
+        "run_qc_x_s": cfg.run_qc_x_s,
         "sync_quality_flag": "not_processed",
         "sync_end_difference_s": np.nan,
     }
@@ -153,18 +193,12 @@ def process_run(
         metrics = extract_metrics(
             windows,
             preprocessed,
-            cfg.max_moment_missing_fraction,
+            cfg,
         )
 
-        valid_trials = metrics.loc[
-            metrics["moment_valid"],
-            "trial_n",
-        ].nunique()
-
-        total_trials = trials["trial_n"].nunique()
-
-        qc["valid_trial_fraction"] = (
-            valid_trials / max(1, total_trials)
+        qc["valid_trial_fraction"] = _get_run_qc_trial_fraction(
+            metrics,
+            cfg,
         )
 
         if (
@@ -193,6 +227,7 @@ def process_run(
         qc["run_exclusion_reason"] = (
             f"{type(exc).__name__}: {exc}"
         )
+
         return pd.DataFrame(), qc
 
 
@@ -206,8 +241,14 @@ def main(
 
     subjects = discover_subjects(data_root)
 
-    print(f"[1/5] Sujets détectés : {len(subjects)}")
+    print(f"[1/6] Sujets détectés : {len(subjects)}")
     print(f"      Output : {output_dirs['root']}")
+    print(
+        "      Exploration X : "
+        f"{cfg.dynamic_x_values_s[0]:.1f}s → "
+        f"{cfg.dynamic_x_values_s[-1]:.1f}s "
+        f"({len(cfg.dynamic_x_values_s)} valeurs)"
+    )
 
     all_metrics: list[pd.DataFrame] = []
     run_qc_rows: list[dict] = []
@@ -215,7 +256,7 @@ def main(
     for subject_dir in subjects:
         subject_id = subject_dir.name.replace("C4X", "")
 
-        # Run 0 = entraînement : exclu systématiquement.
+        # Run0 = entraînement, exclu systématiquement.
         for run_id in range(1, 6):
             metrics, qc = process_run(
                 subject_dir,
@@ -243,7 +284,7 @@ def main(
     )
 
     print(
-        f"[2/5] Runs valides : "
+        f"[2/6] Runs valides : "
         f"{int(run_qc['run_valid'].sum())}/{len(run_qc)}"
     )
 
@@ -280,7 +321,7 @@ def main(
     )
 
     print(
-        f"[3/5] Sujets retenus : "
+        f"[3/6] Sujets retenus : "
         f"{len(kept_subjects)}/{len(subject_qc)} "
         f"(minimum {cfg.min_valid_runs_per_subject} runs)"
     )
@@ -321,20 +362,45 @@ def main(
         index=False,
     )
 
-    # Déduplique car metrics_long a une ligne par métrique.
+    # QC fenêtres affichée seulement pour X utilisé dans QC run.
+    dynamic_moments = [
+        "M2a_search_start",
+        "M2b_search_end",
+        "M3a_rating_start",
+        "M3b_rating_end",
+    ]
+
     window_qc = metrics_long[
         [
             "subject_id",
             "run_id",
             "trial_n",
             "moment",
+            "window_x_s",
             "moment_valid",
             "moment_exclusion_reason",
         ]
     ].drop_duplicates()
 
+    qc_m1 = window_qc.loc[
+        window_qc["moment"] == "M1_induction"
+    ]
+
+    qc_dynamic = window_qc.loc[
+        window_qc["moment"].isin(dynamic_moments)
+        & np.isclose(
+            window_qc["window_x_s"].astype(float),
+            cfg.run_qc_x_s,
+        )
+    ]
+
+    qc_to_display = pd.concat(
+        [qc_m1, qc_dynamic],
+        ignore_index=True,
+    )
+
     valid_by_moment = (
-        window_qc.groupby("moment")["moment_valid"]
+        qc_to_display.groupby("moment")["moment_valid"]
         .agg(["sum", "count"])
         .rename(
             columns={
@@ -344,7 +410,10 @@ def main(
         )
     )
 
-    print("[4/5] Fenêtres valides par moment :")
+    print(
+        f"[4/6] Fenêtres valides par moment "
+        f"(QC avec X={cfg.run_qc_x_s:.1f}s) :"
+    )
 
     for moment, row in valid_by_moment.iterrows():
         print(
@@ -353,14 +422,10 @@ def main(
         )
 
     if not moment_exclusion_summary.empty:
-        print("      Raisons d'exclusion des fenêtres :")
-
-        for _, row in moment_exclusion_summary.iterrows():
-            print(
-                f"      - {row['moment']} | "
-                f"{row['reason']}: "
-                f"{int(row['n_windows'])}"
-            )
+        print(
+            "      Les exclusions détaillées par X sont dans : "
+            "moment_exclusion_summary.csv"
+        )
 
     stats_df = fit_mixed_models(metrics_long, cfg)
 
@@ -373,21 +438,19 @@ def main(
         stats_df["model_reliable"]
     ].copy()
 
-    print(
-        f"[5/5] Modèles fiables : "
-        f"{len(reliable_models)}/{len(stats_df)}"
+    n_significant = int(
+        reliable_models["significant_fdr"].sum()
     )
 
-    for _, row in reliable_models.iterrows():
-        print(
-            f"      {row['scheme']} | "
-            f"{row['moment']} | "
-            f"{row['metric']} | "
-            f"p_FDR={row['p_fdr']:.4g} | "
-            f"effet_std={row['effect_size_std_max_contrast']:.3f}"
-        )
+    print(
+        f"[5/6] Modèles fiables : "
+        f"{len(reliable_models)}/{len(stats_df)} | "
+        f"significatifs après FDR : {n_significant}"
+    )
 
-    # Figures exclusions
+    # --------------------------------------------------------------
+    # Figures exclusion
+    # --------------------------------------------------------------
     plot_exclusion_funnel(
         run_qc,
         subject_qc,
@@ -407,23 +470,37 @@ def main(
         "arousal",
     ]
 
-    # Heatmaps classiques + trois tableaux PNG finaux.
+    # --------------------------------------------------------------
+    # Trois tableaux PNG par X.
+    # 16 valeurs X × 3 schémas = 48 tableaux.
+    # --------------------------------------------------------------
+    for x_s in cfg.dynamic_x_values_s:
+        for scheme in schemes:
+            plot_results_table_for_x(
+                stats_df,
+                scheme,
+                x_s,
+                output_dirs["figures_results_tables"],
+                cfg,
+            )
+
+    # --------------------------------------------------------------
+    # Heatmaps de stabilité selon X.
+    # --------------------------------------------------------------
     for scheme in schemes:
-        plot_fdr_heatmap(
-            stats_df,
-            scheme,
-            output_dirs["figures_heatmaps"],
-            cfg,
-        )
+        for moment in dynamic_moments:
+            plot_x_stability(
+                stats_df,
+                scheme,
+                moment,
+                output_dirs["figures_x_stability"],
+                cfg,
+            )
 
-        plot_results_table_png(
-            stats_df,
-            scheme,
-            output_dirs["figures_heatmaps"],
-            cfg,
-        )
-
-    # Figures descriptives séparées par hypothèse.
+    # --------------------------------------------------------------
+    # Figures descriptives sujet × condition.
+    # Une figure par hypothèse, moment, métrique et X.
+    # --------------------------------------------------------------
     for _, row in stats_df.iterrows():
         reliable = bool(row.get("model_reliable", False))
 
@@ -433,18 +510,26 @@ def main(
         ):
             continue
 
+        moment = str(row["moment"])
+
+        if moment == "M1_induction":
+            x_for_plot = cfg.dynamic_x_values_s[0]
+        else:
+            x_for_plot = float(row["window_x_s"])
+
         plot_distribution(
             metrics_long,
             stats_df,
-            row["scheme"],
-            row["moment"],
-            row["metric"],
+            str(row["scheme"]),
+            moment,
+            str(row["metric"]),
+            x_for_plot,
             output_dirs["figures_hypotheses"],
             cfg,
         )
 
     print(
-        "Pipeline terminé. Résultats : "
+        "[6/6] Pipeline terminé. Résultats : "
         f"{output_dirs['root']}"
     )
 

@@ -18,7 +18,7 @@ GROUP_SCHEMES = {
     "arousal": "group_arousal",
 }
 
-# Métriques participant à l'analyse pupillométrique principale et à la FDR.
+# Les métriques QC / regard ne participent pas à la FDR pupillométrique.
 PRIMARY_PUPIL_METRICS = {
     "pupil_mean",
     "pupil_sd",
@@ -34,11 +34,13 @@ def aggregate_to_induction_blocks(
     metrics_long: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Agrège les essais en blocs d'induction.
+    Agrège les essais d'un même bloc d'induction.
 
-    Les moments M2/M3 sont présents sur les trois essais d'un bloc.
-    Ils sont moyennés avant l'analyse afin de ne pas considérer les trois
-    essais partageant une même induction comme indépendants.
+    Les trois essais d'un bloc partagent la même induction émotionnelle.
+    Pour M2/M3, ils sont donc moyennés avant l'analyse statistique.
+
+    Niveau final :
+        sujet × run × induction_block × moment × X × métrique.
     """
     valid = metrics_long.loc[
         metrics_long["moment_valid"]
@@ -50,6 +52,7 @@ def aggregate_to_induction_blocks(
         "run_id",
         "induction_block_id",
         "moment",
+        "window_x_s",
         "metric",
         "group_5cat",
         "group_valence",
@@ -137,8 +140,8 @@ def _fit_mixedlm_with_retries(
 def _has_critical_warning(
     warning_messages: list[str],
 ) -> bool:
-    """Détecte les warnings invalidant les p-values Wald."""
-    critical = [
+    """Détecte les warnings invalidant l'inférence Wald."""
+    critical_patterns = [
         "Hessian matrix at the estimated parameter values is not positive definite",
         "Maximum Likelihood optimization failed to converge",
         "MixedLM optimization failed",
@@ -146,7 +149,10 @@ def _has_critical_warning(
     ]
 
     return any(
-        any(pattern.lower() in message.lower() for pattern in critical)
+        any(
+            pattern.lower() in message.lower()
+            for pattern in critical_patterns
+        )
         for message in warning_messages
     )
 
@@ -155,7 +161,7 @@ def _is_singular_random_effect(
     fit: object,
     tolerance: float = 1e-8,
 ) -> bool:
-    """Indique si la variance aléatoire sujet est proche de zéro."""
+    """Indique si la variance inter-sujet est quasi nulle."""
     try:
         covariance = np.asarray(fit.cov_re, dtype=float)
 
@@ -178,12 +184,13 @@ def fit_mixed_models(
     cfg: Config,
 ) -> pd.DataFrame:
     """
-    Ajuste un modèle mixte par schéma x moment x métrique.
+    Ajuste un modèle mixte par schéma × moment × métrique × X.
 
     Modèle :
         value_z ~ C(condition) + C(run_id) + (1 | subject_id)
 
-    Les données sont analysées au niveau bloc d'induction.
+    Les analyses sont faites au niveau des blocs d'induction,
+    pas au niveau des essais bruts.
     """
     results: list[dict] = []
 
@@ -195,9 +202,12 @@ def fit_mixed_models(
     ].copy()
 
     for scheme_name, group_column in GROUP_SCHEMES.items():
-        for (moment, metric), data in valid.groupby(
-            ["moment", "metric"]
-        ):
+        grouped = valid.groupby(
+            ["moment", "metric", "window_x_s"],
+            dropna=False,
+        )
+
+        for (moment, metric, window_x_s), data in grouped:
             data = data.dropna(
                 subset=[
                     "subject_id",
@@ -223,6 +233,7 @@ def fit_mixed_models(
                 "group_column": group_column,
                 "moment": moment,
                 "metric": metric,
+                "window_x_s": window_x_s,
                 "n_induction_blocks": n_rows,
                 "n_subjects": n_subjects,
                 "n_levels": n_levels,
@@ -269,13 +280,12 @@ def fit_mixed_models(
                 results.append(base)
                 continue
 
+            # Standardisation uniquement pour améliorer la stabilité numérique.
             data["value_z"] = (
                 data["value"] - data["value"].mean()
             ) / value_sd
 
-            formula = (
-                f"value_z ~ C({group_column}) + C(run_id)"
-            )
+            formula = f"value_z ~ C({group_column}) + C(run_id)"
 
             fit, messages, optimizer = _fit_mixedlm_with_retries(
                 formula,
@@ -297,7 +307,8 @@ def fit_mixed_models(
 
             try:
                 group_terms = [
-                    term for term in fit.params.index
+                    term
+                    for term in fit.params.index
                     if term.startswith(f"C({group_column})")
                 ]
 
@@ -334,6 +345,7 @@ def fit_mixed_models(
                 standard_errors = fit.bse[group_terms]
 
                 strongest_term = parameters.abs().idxmax()
+
                 estimate = float(parameters[strongest_term])
                 standard_error = float(
                     standard_errors[strongest_term]
@@ -349,8 +361,12 @@ def fit_mixed_models(
                         "p_raw": p_raw,
                         "strongest_contrast": strongest_term,
                         "effect_size_std_max_contrast": estimate,
-                        "ci_low_std": estimate - 1.96 * standard_error,
-                        "ci_high_std": estimate + 1.96 * standard_error,
+                        "ci_low_std": (
+                            estimate - 1.96 * standard_error
+                        ),
+                        "ci_high_std": (
+                            estimate + 1.96 * standard_error
+                        ),
                         "aic": float(fit.aic),
                     }
                 )
@@ -369,8 +385,9 @@ def fit_mixed_models(
     if results_df.empty:
         return results_df
 
-    # Une correction FDR indépendante par schéma :
-    # cinq catégories, valence, arousal.
+    # FDR par schéma.
+    # Chaque famille inclut :
+    # moments × métriques × toutes les valeurs X.
     for _, indices in results_df.groupby("scheme").groups.items():
         subset = results_df.loc[indices].copy()
 
@@ -391,7 +408,11 @@ def fit_mixed_models(
 
         eligible_indices = subset.loc[eligible].index
 
-        results_df.loc[eligible_indices, "p_fdr"] = p_corrected
+        results_df.loc[
+            eligible_indices,
+            "p_fdr",
+        ] = p_corrected
+
         results_df.loc[
             eligible_indices,
             "significant_fdr",
