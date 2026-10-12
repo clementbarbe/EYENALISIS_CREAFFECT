@@ -163,52 +163,23 @@ def summarize_subject_exclusions(
     )
 
 
-def summarize_moment_exclusions(
-    metrics_long: pd.DataFrame,
-) -> pd.DataFrame:
-    """Compte les exclusions au niveau essai × moment."""
-    keys = [
-        "subject_id",
-        "run_id",
-        "trial_n",
-        "moment",
-        "moment_valid",
-        "moment_exclusion_reason",
-    ]
+def summarize_moment_exclusions(metrics_long: pd.DataFrame) -> pd.DataFrame:
+    """Exclusions *par métrique* (et non pseudo-compte des fenêtres uniques).
 
-    available = [column for column in keys if column in metrics_long.columns]
-
-    windows = metrics_long[available].drop_duplicates()
-
-    excluded = windows.loc[
-        ~windows["moment_valid"].fillna(False)
-    ].copy()
-
-    if excluded.empty:
-        return pd.DataFrame(
-            columns=["moment", "reason", "n_windows"]
-        )
-
-    excluded["moment_exclusion_reason"] = (
-        excluded["moment_exclusion_reason"]
-        .fillna("unknown")
-        .replace("", "unknown")
-    )
-
-    return (
-        excluded.groupby(
-            ["moment", "moment_exclusion_reason"],
-            as_index=False,
-        )
-        .size()
-        .rename(
-            columns={
-                "moment_exclusion_reason": "reason",
-                "size": "n_windows",
-            }
-        )
-        .sort_values(
-            ["moment", "n_windows"],
-            ascending=[True, False],
-        )
-    )
+    La même fenêtre peut être valide pour gaze mais invalide pour pupillométrie.
+    ROI non configurée ou microsaccades non validées apparaissent séparément.
+    """
+    cols = ['moment','metric','reason','n_metric_windows','n_subjects']
+    if metrics_long.empty:
+        return pd.DataFrame(columns=cols)
+    keys = ['subject_id','run_id','trial_n','moment','metric','moment_valid',
+            'moment_exclusion_reason']
+    a = metrics_long.loc[~metrics_long['moment_valid'].fillna(False), keys].drop_duplicates().copy()
+    if a.empty:
+        return pd.DataFrame(columns=cols)
+    a['reason'] = a['moment_exclusion_reason'].fillna('').replace('','unclassified').str.split(';')
+    a = a.explode('reason')
+    return (a.groupby(['moment','metric','reason'],as_index=False)
+             .agg(n_metric_windows=('trial_n','size'),
+                  n_subjects=('subject_id','nunique'))
+             .sort_values(['moment','metric','n_metric_windows'],ascending=[True,True,False]))

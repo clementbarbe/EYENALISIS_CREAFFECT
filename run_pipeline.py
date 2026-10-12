@@ -1,9 +1,13 @@
-"""Point d'entrée du pipeline FGAT eyetracking confirmatoire."""
+"""Pipeline exploratoire CREAFFECT eye-tracking pendant IRMf; runs 1 à 5."""
 
 from __future__ import annotations
 
 import argparse
 import re
+import json
+import importlib.metadata
+from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +21,11 @@ from exclusion import (
     summarize_run_exclusions,
     summarize_subject_exclusions,
 )
+from matching import build_manifest
+from timecourse import make_timecourses
+from descriptives import export_descriptives
+from qc_plots import plot_run_qc
+from stats_robust import run_clustered_models
 from metrics import (
     extract_h4_gaze_samples,
     extract_metrics,
@@ -47,34 +56,13 @@ def discover_subjects(data_root: Path) -> list[Path]:
     )
 
 
-def find_run_files(
-    subject_dir: Path,
-    subject_id: str,
-    run_id: int,
-) -> tuple[Path | None, Path | None]:
-    """Trouve le CSV comportemental et l'ASC correspondant."""
-    csv_path = subject_dir / (
-        f"FGAT_Dist_Run{run_id}_C4X{subject_id}.csv"
-    )
-
-    asc_candidates = [
-        subject_dir / f"{subject_id}_{run_id}.asc",
-        subject_dir / f"C4X{subject_id}_{run_id}.asc",
-    ]
-
-    asc_path = next(
-        (
-            candidate
-            for candidate in asc_candidates
-            if candidate.exists()
-        ),
-        None,
-    )
-
-    return (
-        csv_path if csv_path.exists() else None,
-        asc_path,
-    )
+def find_run_files(subject_dir: Path, subject_id: str, run_id: int,
+                   matched_asc: dict[int, Path] | None = None) -> tuple[Path | None, Path | None]:
+    """Recherche CSV par run et ASC UNIQUEMENT via RUN_START/RUN_END."""
+    csv_path = subject_dir / f"FGAT_Dist_Run{run_id}_C4X{subject_id}.csv"
+    if matched_asc is None:
+        matched_asc, _ = build_manifest(subject_dir)
+    return (csv_path if csv_path.exists() else None, matched_asc.get(run_id))
 
 
 def process_run(
@@ -82,17 +70,24 @@ def process_run(
     subject_id: str,
     run_id: int,
     cfg,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    matched_asc: dict[int, Path] | None = None,
+    output_root: Path | None = None,
+    collect_timecourses: bool = True,
+    make_qc_plot: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
     """Traite un run complet sans interrompre le pipeline."""
     csv_path, asc_path = find_run_files(
         subject_dir,
         subject_id,
         run_id,
+        matched_asc,
     )
 
     qc = {
         "subject_id": subject_id,
         "run_id": run_id,
+        "asc_path": str(asc_path) if asc_path is not None else "",
+        "behavior_csv": str(csv_path) if csv_path is not None else "",
         "run_valid": False,
         "run_exclusion_reason": "",
         "run_missing_fraction": np.nan,
@@ -106,11 +101,11 @@ def process_run(
 
     if csv_path is None:
         qc["run_exclusion_reason"] = "missing_behavior_csv"
-        return pd.DataFrame(), pd.DataFrame(), qc
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), qc
 
     if asc_path is None:
         qc["run_exclusion_reason"] = "missing_asc"
-        return pd.DataFrame(), pd.DataFrame(), qc
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), qc
 
     try:
         trials, timing = parse_behavior_csv(
@@ -126,8 +121,12 @@ def process_run(
             timing,
             samples,
             cfg,
+            expected_run_id=run_id,
         )
 
+        qc["sync_n_triggers"] = sync.n_triggers
+        qc["sync_trigger_interval_median_s"] = sync.median_trigger_interval_s
+        qc["sync_trigger_interval_cv"] = sync.trigger_interval_cv
         qc["sync_quality_flag"] = sync.quality_flag
         qc["sync_end_difference_s"] = sync.end_difference_s
 
@@ -144,6 +143,18 @@ def process_run(
                 blink_intervals["blink_duration_ms"].mean()
             )
 
+        # Diagnostics de dépendance taille de pupille / position du regard.
+        subset = preprocessed.loc[preprocessed['pupil_observed_valid'] & preprocessed['gaze_valid']]
+        for axis in ('x', 'y'):
+            column = f'gaze_{axis}_clean'
+            qc[f'pupil_gaze_{axis}_correlation'] = (
+                float(subset['pupil_clean'].corr(subset[column]))
+                if len(subset) >= 100 and subset[column].std() > 1e-9 else np.nan)
+        qc['run_artifact_fraction'] = float(preprocessed['pupil_artifact_mask'].mean())
+        qc['run_interpolated_fraction'] = float(preprocessed['pupil_interpolated'].mean())
+        qc['run_gaze_valid_fraction'] = float(preprocessed['gaze_valid'].mean())
+        if make_qc_plot and output_root is not None:
+            plot_run_qc(preprocessed, f'C4X{subject_id}_run{run_id}', output_root / 'figures' / 'qc_traces')
         qc.update(
             evaluate_run_exclusion(
                 preprocessed,
@@ -153,7 +164,7 @@ def process_run(
         )
 
         if not qc["run_valid"]:
-            return pd.DataFrame(), pd.DataFrame(), qc
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), qc
 
         windows = build_moment_windows(
             trials,
@@ -171,12 +182,10 @@ def process_run(
         )
 
         gaze_samples = extract_h4_gaze_samples(
-            windows,
-            preprocessed,
-            cfg,
+            windows, preprocessed, cfg,
         )
-
-        return metrics, gaze_samples, qc
+        timecourses = make_timecourses(windows, preprocessed, cfg) if collect_timecourses else pd.DataFrame()
+        return metrics, gaze_samples, timecourses, qc
 
     except Exception as exc:
         qc["run_valid"] = False
@@ -184,7 +193,7 @@ def process_run(
             f"{type(exc).__name__}: {exc}"
         )
 
-        return pd.DataFrame(), pd.DataFrame(), qc
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), qc
 
 
 def print_stats_summary(stats_df: pd.DataFrame) -> None:
@@ -237,11 +246,29 @@ def print_stats_summary(stats_df: pd.DataFrame) -> None:
 def main(
     data_root: Path,
     output_root: Path,
+    no_stats: bool = False,
+    no_figures: bool = False,
+    no_timecourses: bool = False,
+    qc_plots: bool = False,
+    run_mixedlm: bool = False,
 ) -> None:
     """Exécute le pipeline complet."""
     cfg = DEFAULT_CONFIG
     output_dirs = make_output_dirs(output_root)
 
+    (output_dirs["root"] / "config_used.json").write_text(
+        json.dumps({"generated_utc":datetime.now(timezone.utc).isoformat(),
+                    "config":asdict(cfg), "analysis_type":"exploratory"},
+                   indent=2, ensure_ascii=False), encoding="utf-8")
+    deps = ['numpy', 'pandas', 'scipy', 'statsmodels', 'matplotlib', 'seaborn']
+    versions = {}
+    for dependency in deps:
+        try:
+            versions[dependency] = importlib.metadata.version(dependency)
+        except importlib.metadata.PackageNotFoundError:
+            versions[dependency] = 'not_installed'
+    (output_dirs["root"] / "dependency_versions.json").write_text(
+        json.dumps(versions, indent=2), encoding='utf-8')
     subjects = discover_subjects(data_root)
 
     print(f"[1/5] Sujets détectés : {len(subjects)}")
@@ -257,7 +284,9 @@ def main(
 
     all_metrics: list[pd.DataFrame] = []
     all_gaze_samples: list[pd.DataFrame] = []
+    all_timecourses: list[pd.DataFrame] = []
     run_qc_rows: list[dict] = []
+    manifest_rows: list[pd.DataFrame] = []
 
     for subject_index, subject_dir in enumerate(subjects, start=1):
         subject_id = subject_dir.name.replace("C4X", "")
@@ -268,13 +297,21 @@ def main(
             flush=True,
         )
 
-        # Run0 exclu : entraînement.
+        # Run0 explicitement ignoré, les ASC sont identifiés par marqueurs.
+        matched_asc, manifest = build_manifest(subject_dir)
+        if not manifest.empty:
+            manifest.insert(0, "subject_id", subject_id)
+            manifest_rows.append(manifest)
         for run_id in range(1, 6):
-            metrics, gaze_samples, qc = process_run(
+            metrics, gaze_samples, timecourses, qc = process_run(
                 subject_dir,
                 subject_id,
                 run_id,
                 cfg,
+                matched_asc,
+                output_root=output_dirs["root"],
+                collect_timecourses=not no_timecourses,
+                make_qc_plot=qc_plots,
             )
 
             run_qc_rows.append(qc)
@@ -284,7 +321,12 @@ def main(
 
             if not gaze_samples.empty:
                 all_gaze_samples.append(gaze_samples)
+            if not timecourses.empty:
+                all_timecourses.append(timecourses)
 
+    if manifest_rows:
+        pd.concat(manifest_rows, ignore_index=True).to_csv(
+            output_dirs["tables"] / "asc_matching_manifest.csv", index=False)
     run_qc = pd.DataFrame(run_qc_rows)
 
     run_qc.to_csv(
@@ -353,6 +395,7 @@ def main(
         index=False,
     )
 
+    export_descriptives(metrics_long, output_dirs["tables"])
     moment_exclusion_summary = summarize_moment_exclusions(metrics_long)
 
     moment_exclusion_summary.to_csv(
@@ -380,19 +423,27 @@ def main(
     else:
         gaze_samples = pd.DataFrame()
 
-    print("[5/5] Ajustement des modèles confirmatoires...")
+    if all_timecourses:
+        pupil_timecourses = pd.concat(all_timecourses,ignore_index=True)
+        pupil_timecourses = pupil_timecourses.loc[pupil_timecourses['subject_id'].isin(kept_subjects)]
+        pupil_timecourses.to_csv(output_dirs["tables"] / "event_locked_pupil_timecourses_20hz.csv",index=False)
+    print("[5/5] Modèles exploratoires (non pré-enregistrés)...")
+    if no_stats:
+        print("Analyses statistiques désactivées (--no-stats).")
+        return
 
-    stats_df = run_confirmatory_models(
-        metrics_long,
-        cfg,
-    )
-
-    stats_df.to_csv(
-        output_dirs["tables"] / "confirmatory_models_fdr.csv",
-        index=False,
-    )
-
-    print_stats_summary(stats_df)
+    # Modèle principal exploratoire : sujets en effets fixes, SE robustes par
+    # participant. L'agrégation par participant couvre les blocs imbriqués.
+    stats_df = run_clustered_models(metrics_long, cfg)
+    stats_df.to_csv(output_dirs["tables"] / "exploratory_subject_clustered_models_fdr.csv", index=False)
+    if run_mixedlm:
+        legacy = run_confirmatory_models(metrics_long, cfg)
+        legacy.to_csv(output_dirs["tables"] / "exploratory_mixedlm_sensitivity_fdr.csv",index=False)
+    if 'model_reliable' in stats_df:
+        print_stats_summary(stats_df)
+    if no_figures:
+        print("Figures désactivées (--no-figures).")
+        return
 
     print("[5/5] Création des figures...")
 
@@ -441,7 +492,7 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Pipeline confirmatoire pupillométrie FGAT."
+        description="Pipeline exploratoire pupillométrie CREAFFECT en IRMf."
     )
 
     parser.add_argument(
@@ -460,6 +511,16 @@ if __name__ == "__main__":
         ),
     )
 
+    parser.add_argument("--no-timecourses",action="store_true",
+                        help="Ne pas exporter les courbes pupillaires 20 Hz")
+    parser.add_argument("--qc-plots",action="store_true",
+                        help="Créer un graphique diagnostic brut/nettoyé par run")
+    parser.add_argument("--mixedlm",action="store_true",
+                        help="Lancer en complément les anciens modèles mixtes (coûteux)")
+    parser.add_argument("--no-stats", action="store_true",
+                        help="Calcul QC/métriques uniquement, sans modèles ni figures")
+    parser.add_argument("--no-figures", action="store_true",
+                        help="Conserver les modèles et tableaux, sans graphiques")
     args = parser.parse_args()
 
     data_root = args.data_root.resolve()
@@ -475,4 +536,6 @@ if __name__ == "__main__":
         else data_root / "output"
     )
 
-    main(data_root, output_root)
+    main(data_root, output_root, no_stats=args.no_stats,
+         no_figures=args.no_figures, no_timecourses=args.no_timecourses,
+         qc_plots=args.qc_plots, run_mixedlm=args.mixedlm)

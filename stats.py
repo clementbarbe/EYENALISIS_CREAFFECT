@@ -1,4 +1,4 @@
-"""Analyses statistiques confirmatoires FGAT."""
+"""Modèles mixtes historiques : sensibilité exploratoire, non confirmatoire."""
 
 from __future__ import annotations
 
@@ -174,7 +174,7 @@ def run_confirmatory_models(
     cfg: Config,
 ) -> pd.DataFrame:
     """
-    Lance les analyses H1, H2 et H3.
+    Lance les modèles mixtes de sensibilité H1, H2 et H3.
 
     H1:
         Catégorie émotionnelle -> pupille et saccades pendant induction tardive.

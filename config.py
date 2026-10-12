@@ -21,8 +21,8 @@ class Config:
     # --------------------------------------------------------------
     sync_button_code: int = 1
     sync_button_state: int = 1
-    max_sync_end_difference_s: float = 10.0
-    exclude_bad_sync_end_check: bool = False
+    max_sync_end_difference_s: float = 2.0
+    exclude_bad_sync_end_check: bool = True
 
     # --------------------------------------------------------------
     # Prétraitement pupillaire
@@ -36,7 +36,7 @@ class Config:
     pupil_speed_mad_threshold: float = 6.0
     pupil_outlier_mad_threshold: float = 6.0
 
-    interpolation_max_gap_ms: int = 500
+    interpolation_max_gap_ms: int = 200
 
     lowpass_enabled: bool = True
     lowpass_cutoff_hz: float = 6.0
@@ -50,10 +50,10 @@ class Config:
     max_run_acquisition_missing_fraction: float = 0.45
 
     # Une fenêtre est exclue si >50% du signal est vraiment absent.
-    max_moment_missing_fraction: float = 0.40
+    max_moment_missing_fraction: float = 0.30
 
     # Baseline invalide si >50% manquant.
-    max_baseline_missing_fraction: float = 0.40
+    max_baseline_missing_fraction: float = 0.25
 
     # Conservé pour compatibilité, mais le run n'est plus exclu sur ce critère.
     min_valid_trial_fraction_per_run: float = 0.0
@@ -61,6 +61,17 @@ class Config:
     # Sujet exclu seulement s'il a moins de deux runs réellement exploitables.
     min_valid_runs_per_subject: int = 2
 
+    # Paramètres QC exploratoires (à valider sur distributions aveugles aux conditions)
+    max_interpolated_fraction_window: float = 0.20
+    min_observed_fraction_window: float = 0.70
+    min_observed_fraction_baseline: float = 0.75
+    max_longest_gap_window_ms: float = 500.0
+    max_window_missing_sampling_fraction: float = 0.05
+    min_gaze_valid_fraction: float = 0.70
+    max_sync_drift_ppm_warning: float = 150.0
+    max_sync_pulse_interval_cv: float = 0.05
+    gaze_screen_width_px: float = 1920.0
+    gaze_screen_height_px: float = 1080.0
     # --------------------------------------------------------------
     # Fenêtres temporelles : analyses principales
     # --------------------------------------------------------------
@@ -76,6 +87,8 @@ class Config:
 
     # H2 principal : fenêtre juste avant le clic "idée trouvée".
     fixed_pre_idea_window_s: float = 1.0
+    pre_idea_motor_exclusion_s: float = 0.2
+    liking_fixed_window_s: float = 1.0
 
     # H3 principal : première appréciation, avant le premier mouvement.
     liking_use_first_movement: bool = True
@@ -83,7 +96,7 @@ class Config:
     # Une fenêtre tronquée est conservée si elle contient au moins 500 ms.
     minimum_usable_window_s: float = 0.5
 
-    # Baseline : dernières 500 ms de la croix de fixation précédente.
+    # Baseline soustractive : dernières 500 ms de la croix de fixation précédente.
     baseline_duration_s: float = 0.5
 
     # --------------------------------------------------------------
@@ -163,8 +176,8 @@ class Config:
     alpha: float = 0.05
     fdr_method: str = "fdr_bh"
 
-    min_rows_for_model: int = 12
-    min_subjects_for_model: int = 5
+    min_rows_for_model: int = 30
+    min_subjects_for_model: int = 12
     min_levels_for_model: int = 2
 
     # --------------------------------------------------------------

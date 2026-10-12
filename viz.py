@@ -1,4 +1,4 @@
-"""Visualisations confirmatoires FGAT eyetracking."""
+"""Visualisations exploratoires CREAFFECT."""
 
 from __future__ import annotations
 
@@ -208,7 +208,7 @@ def plot_results_table(
         text.set_color("white")
 
     ax.set_title(
-        "Résultats confirmatoires\n"
+        "Résultats exploratoires\n"
         "Vert : p FDR < .05 | "
         "Gris foncé : non significatif | "
         "Gris clair : non estimable",
@@ -221,7 +221,7 @@ def plot_results_table(
     fig.tight_layout()
 
     fig.savefig(
-        output_dir / "confirmatory_results_table.png",
+        output_dir / "exploratory_results_table.png",
         dpi=cfg.dpi,
         bbox_inches="tight",
     )
@@ -411,84 +411,51 @@ def plot_gaze_heatmaps(
     output_dir: Path,
     cfg: Config,
 ) -> None:
-    """
-    Crée une heatmap gaze pour chaque catégorie émotionnelle.
+    """Densité gaze pondérée *également par essai puis par participant*.
 
-    Les heatmaps H4 correspondent à :
-    fgat_cue_onset -> fgat_input_time.
+    Histogramme 2D lissé plutôt que KDE sur des millions de points : rapide,
+    transparent, indépendant de la durée des essais et équilibré par sujet.
+    Le lissage est visualisation uniquement, pas une estimation de fixation.
     """
+    from scipy.ndimage import gaussian_filter
     if gaze_samples.empty:
         return
-
-    categories = [
-        "LVLA",
-        "LVHA",
-        "MVMA",
-        "HVLA",
-        "HVHA",
-    ]
-
-    valid = gaze_samples.dropna(subset=["gaze_x", "gaze_y"]).copy()
-
-    for category in categories:
-        data = valid.loc[
-            valid["group_5cat"] == category
-        ].copy()
-
+    valid = gaze_samples.loc[
+        gaze_samples['gaze_x'].between(0,cfg.gaze_screen_width_px, inclusive='left')
+        & gaze_samples['gaze_y'].between(0,cfg.gaze_screen_height_px,inclusive='left')
+    ].copy()
+    for category in ('LVLA','LVHA','MVMA','HVLA','HVHA'):
+        data = valid.loc[valid['group_5cat'].eq(category)].copy()
         if data.empty:
             continue
-
-        fig, ax = plt.subplots(figsize=(8, 6))
-
-        sns.kdeplot(
-            data=data,
-            x="gaze_x",
-            y="gaze_y",
-            fill=True,
-            thresh=0.05,
-            levels=50,
-            cmap="mako",
-            ax=ax,
-        )
-
-        if (
-            cfg.cue_roi_center_x is not None
-            and cfg.cue_roi_center_y is not None
-        ):
-            rectangle = plt.Rectangle(
-                (
-                    cfg.cue_roi_center_x
-                    - cfg.cue_roi_half_width_px,
-                    cfg.cue_roi_center_y
-                    - cfg.cue_roi_half_height_px,
-                ),
-                2 * cfg.cue_roi_half_width_px,
-                2 * cfg.cue_roi_half_height_px,
-                linewidth=2,
-                edgecolor="red",
-                facecolor="none",
-                label="ROI cue",
-            )
-
-            ax.add_patch(rectangle)
-            ax.legend()
-
-        ax.invert_yaxis()
-
-        ax.set_title(
-            f"H4 — Densité du regard pendant recherche d'idée\n"
-            f"Catégorie : {category}"
-        )
-
-        ax.set_xlabel("Gaze X (pixels)")
-        ax.set_ylabel("Gaze Y (pixels)")
-
+        # Chaque essai contribue autant; chaque participant autant.
+        trials_per_subject = (data[['subject_id','run_id','trial_n']]
+                              .drop_duplicates().groupby('subject_id').size())
+        subject_weights = data['subject_id'].map((1 / trials_per_subject).to_dict()).to_numpy(dtype=float)
+        sample_weights = data['sample_weight'].to_numpy(dtype=float) * subject_weights
+        counts, _, _ = np.histogram2d(
+            data['gaze_y'].to_numpy(dtype=float),
+            data['gaze_x'].to_numpy(dtype=float),
+            bins=(54,96), range=((0,cfg.gaze_screen_height_px),(0,cfg.gaze_screen_width_px)),
+            weights=sample_weights)
+        smoothed = gaussian_filter(counts, sigma=1.5)
+        if smoothed.sum():
+            smoothed /= smoothed.sum()
+        fig, ax = plt.subplots(figsize=(11,6.25))
+        im = ax.imshow(smoothed, origin='upper', interpolation='nearest',
+                       extent=(0,cfg.gaze_screen_width_px,
+                               cfg.gaze_screen_height_px,0),aspect='auto',cmap='magma')
+        if cfg.cue_roi_center_x is not None and cfg.cue_roi_center_y is not None:
+            from matplotlib.patches import Rectangle
+            ax.add_patch(Rectangle(
+                (cfg.cue_roi_center_x-cfg.cue_roi_half_width_px,
+                 cfg.cue_roi_center_y-cfg.cue_roi_half_height_px),
+                2*cfg.cue_roi_half_width_px,2*cfg.cue_roi_half_height_px,
+                edgecolor='cyan',facecolor='none',lw=2))
+        ax.set(xlabel='Gaze X (px)',ylabel='Gaze Y (px)',
+               title=f'CREAFFECT H4 – {category} | sujets={data.subject_id.nunique()} '
+                     '(participants pondérés équitablement)')
+        fig.colorbar(im, ax=ax, fraction=.045, label='Densité relative lissée')
         fig.tight_layout()
-
-        fig.savefig(
-            output_dir / f"gaze_heatmap_{category}.png",
-            dpi=cfg.dpi,
-            bbox_inches="tight",
-        )
-
+        fig.savefig(output_dir/f'gaze_heatmap_{category}.png',dpi=cfg.dpi)
         plt.close(fig)

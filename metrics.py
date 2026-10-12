@@ -132,23 +132,23 @@ def pupil_slope(
 
 
 @register_metric("pupil_auc")
-def pupil_auc(
-    window: pd.DataFrame,
-    baseline: float,
-    blinks: pd.DataFrame,
-    events: pd.DataFrame,
-    cfg: Config,
-) -> float:
-    """Aire sous la courbe pupillaire."""
-    valid = window.dropna(subset=["pupil_clean"])
+def pupil_auc(window: pd.DataFrame, baseline: float, blinks: pd.DataFrame,
+              events: pd.DataFrame, cfg: Config) -> float:
+    """Aire baseline-corrigée sur sous-segments observés/filtrés contigus.
 
-    if len(valid) < 2:
+    La valeur n'est PAS extrapolée aux lacunes: comparer avec couverture et durée.
+    """
+    if not np.isfinite(baseline) or window.empty:
         return np.nan
-
-    x_s = valid["timestamp_ms"].to_numpy() / 1000.0
-    y = valid["pupil_clean"].to_numpy()
-
-    return float(np.trapz(y, x_s))
+    t = window['timestamp_ms'].to_numpy(dtype=float)
+    y = window['pupil_clean'].to_numpy(dtype=float) - baseline
+    valid = np.isfinite(y)
+    if valid.sum() < 2:
+        return np.nan
+    dt_expected = 1000.0 / cfg.sampling_rate_hz
+    good_pairs = valid[:-1] & valid[1:] & (np.diff(t) <= dt_expected * 1.5)
+    return float(np.sum((y[:-1][good_pairs] + y[1:][good_pairs]) *
+                        np.diff(t)[good_pairs] / 2000.0))
 
 
 @register_metric("pupil_peak")
@@ -335,7 +335,7 @@ def gaze_dispersion_x(
     cfg: Config,
 ) -> float:
     """Dispersion horizontale du regard."""
-    return float(window["gaze_x"].std(ddof=1))
+    return float(window["gaze_x_clean"].std(ddof=1))
 
 
 @register_metric("gaze_dispersion_y")
@@ -347,7 +347,7 @@ def gaze_dispersion_y(
     cfg: Config,
 ) -> float:
     """Dispersion verticale du regard."""
-    return float(window["gaze_y"].std(ddof=1))
+    return float(window["gaze_y_clean"].std(ddof=1))
 
 
 @register_metric("gaze_aversion_fraction")
@@ -365,17 +365,17 @@ def gaze_aversion_fraction(
     ):
         return np.nan
 
-    gaze = window.dropna(subset=["gaze_x", "gaze_y"])
+    gaze = window.dropna(subset=["gaze_x_clean", "gaze_y_clean"])
 
     if gaze.empty:
         return np.nan
 
     inside_roi = (
-        gaze["gaze_x"].between(
+        gaze["gaze_x_clean"].between(
             cfg.cue_roi_center_x - cfg.cue_roi_half_width_px,
             cfg.cue_roi_center_x + cfg.cue_roi_half_width_px,
         )
-        & gaze["gaze_y"].between(
+        & gaze["gaze_y_clean"].between(
             cfg.cue_roi_center_y - cfg.cue_roi_half_height_px,
             cfg.cue_roi_center_y + cfg.cue_roi_half_height_px,
         )
@@ -402,135 +402,138 @@ def missing_fraction(
     return float(window[missing_column].mean())
 
 
-def extract_metrics(
-    windows: pd.DataFrame,
-    preprocessed: pd.DataFrame,
-    blink_intervals: pd.DataFrame,
-    events: pd.DataFrame,
-    cfg: Config,
-) -> pd.DataFrame:
-    """Calcule les métriques de toutes les fenêtres."""
-    rows: list[dict] = []
+def _qc_segment(segment: pd.DataFrame, start_ms: float, end_ms: float,
+                cfg: Config) -> dict:
+    """QC indépendant de la condition expérimentale; compter les trous d'horloge."""
+    duration_ms = max(0., float(end_ms) - float(start_ms))
+    if segment.empty or duration_ms <= 0:
+        return dict(observed_valid_fraction=0., artifact_fraction=1.,
+                    interpolated_fraction=0., acquisition_missing_fraction=1.,
+                    gaze_valid_fraction=0., longest_gap_ms=duration_ms,
+                    sampling_coverage_fraction=0., n_samples=0)
+    t = segment['timestamp_ms'].to_numpy(dtype=float)
+    artifact = segment['pupil_artifact_mask'].to_numpy(dtype=bool)
+    observed = segment['pupil_observed_valid'].to_numpy(dtype=bool)
+    interpol = segment['pupil_interpolated'].to_numpy(dtype=bool)
+    gaze = segment['gaze_valid'].to_numpy(dtype=bool)
+    # Fraction du temps couverte (tenant compte des samples manquants dans l'ASC)
+    expected = 1.0 + duration_ms * cfg.sampling_rate_hz / 1000.0
+    coverage = min(1., len(segment) / expected)
+    # Longueur des interruptions: bords + blocs d'artefacts + trous entre samples.
+    missing_t = t[artifact]
+    breaks = np.diff(t)
+    largest_timestamp_gap = float(max(np.max(breaks) - 1000. / cfg.sampling_rate_hz, 0)) if len(breaks) else duration_ms
+    largest_artifact_gap = 0.
+    starts = np.flatnonzero(np.diff(np.r_[0, artifact.astype(np.int8), 0]) == 1)
+    ends = np.flatnonzero(np.diff(np.r_[0, artifact.astype(np.int8), 0]) == -1)
+    if len(starts):
+        largest_artifact_gap = float(np.max(t[ends-1] - t[starts] + 1000./cfg.sampling_rate_hz))
+    edge_gap = max(float(t[0] - start_ms), float(end_ms - t[-1]), 0.)
+    longest = max(largest_timestamp_gap, largest_artifact_gap, edge_gap)
+    return dict(observed_valid_fraction=float(observed.mean()*coverage),
+                artifact_fraction=float(1-observed.mean()*coverage),
+                interpolated_fraction=float(interpol.mean()*coverage),
+                acquisition_missing_fraction=float(segment['pupil_missing_acquisition'].mean()*coverage + 1-coverage),
+                gaze_valid_fraction=float(gaze.mean()*coverage),
+                longest_gap_ms=longest,
+                sampling_coverage_fraction=float(coverage), n_samples=len(segment))
 
-    missing_column = (
-        "pupil_missing_acquisition"
-        if "pupil_missing_acquisition" in preprocessed.columns
-        else "pupil_missing_raw"
-    )
 
-    for _, window_meta in windows.iterrows():
-        segment = preprocessed.loc[
-            preprocessed["timestamp_ms"].between(
-                window_meta["start_eyelink_ms"],
-                window_meta["end_eyelink_ms"],
-                inclusive="both",
-            )
-        ].copy()
-
-        baseline_segment = preprocessed.loc[
-            preprocessed["timestamp_ms"].between(
-                window_meta["baseline_start_eyelink_ms"],
-                window_meta["baseline_end_eyelink_ms"],
-                inclusive="both",
-            )
-        ].copy()
-
-        missing_window = (
-            float(segment[missing_column].mean())
-            if not segment.empty
-            else 1.0
-        )
-
-        baseline_missing = (
-            float(baseline_segment[missing_column].mean())
-            if not baseline_segment.empty
-            else 1.0
-        )
-
-        baseline_value = np.nan
-
-        if (
-            not baseline_segment.empty
-            and baseline_missing <= cfg.max_baseline_missing_fraction
-        ):
-            baseline_value = float(
-                baseline_segment["pupil_clean"].mean()
-            )
-
-        trial_invalid = (
-            bool(window_meta["timeout"])
-            or bool(window_meta["is_resumed"])
-        )
-
-        moment_valid = not (
-            trial_invalid
-            or not bool(window_meta["duration_valid"])
-            or segment.empty
-            or missing_window > cfg.max_moment_missing_fraction
-        )
-
-        if trial_invalid:
-            exclusion_reason = "timeout_or_resumed"
-        elif not bool(window_meta["duration_valid"]):
-            exclusion_reason = "window_too_short"
-        elif segment.empty:
-            exclusion_reason = "no_samples_in_window"
-        elif missing_window > cfg.max_moment_missing_fraction:
-            exclusion_reason = "too_much_acquisition_missing"
-        else:
-            exclusion_reason = ""
-
-        for metric_name, metric_function in METRIC_REGISTRY.items():
-            value = (
-                metric_function(
-                    segment,
-                    baseline_value,
-                    blink_intervals,
-                    events,
-                    cfg,
-                )
-                if moment_valid
-                else np.nan
-            )
-
-            rows.append(
-                {
-                    "subject_id": window_meta["subject_id"],
-                    "run_id": window_meta["run_id"],
-                    "trial_n": window_meta["trial_n"],
-                    "induction_block_id": window_meta[
-                        "induction_block_id"
-                    ],
-                    "moment": window_meta["moment"],
-                    "window_x_s": window_meta["window_x_s"],
-                    "metric": metric_name,
-                    "value": value,
-                    "moment_valid": moment_valid,
-                    "moment_exclusion_reason": exclusion_reason,
-                    "missing_fraction_window": missing_window,
-                    "baseline_value": baseline_value,
-                    "baseline_missing_fraction": baseline_missing,
-                    "actual_duration_s": window_meta[
-                        "actual_duration_s"
-                    ],
-                    "group_5cat": window_meta["group_5cat"],
-                    "group_valence": window_meta["group_valence"],
-                    "group_arousal": window_meta["group_arousal"],
-                    "emo_grid_valence": window_meta.get(
-                        "emo_grid_valence",
-                        np.nan,
-                    ),
-                    "emo_grid_arousal": window_meta.get(
-                        "emo_grid_arousal",
-                        np.nan,
-                    ),
-                    "LTask_rating": window_meta.get(
-                        "LTask_rating",
-                        np.nan,
-                    ),
-                }
-            )
-
+def extract_metrics(windows: pd.DataFrame, preprocessed: pd.DataFrame,
+                    blink_intervals: pd.DataFrame, events: pd.DataFrame,
+                    cfg: Config) -> pd.DataFrame:
+    """QC par essai/fenêtre/métrique. Les métriques non pupillaires restent accessibles."""
+    rows = []
+    if windows.empty or preprocessed.empty:
+        return pd.DataFrame()
+    # Découpage par searchsorted: O(log n), sans refaire un masque de 400k points
+    timestamps = preprocessed['timestamp_ms'].to_numpy(dtype=float)
+    def segment(left, right):
+        if pd.isna(left) or pd.isna(right) or right <= left:
+            return preprocessed.iloc[0:0]
+        a, b = np.searchsorted(timestamps, [left, right], side='left')
+        return preprocessed.iloc[a:b]
+    pupil_metrics = {k for k in METRIC_REGISTRY if k.startswith('pupil_')}
+    gaze_metrics = {k for k in METRIC_REGISTRY if k.startswith('gaze_')}
+    blink_metrics = {k for k in METRIC_REGISTRY if k.startswith('blink_')}
+    # saccades sont une famille distincte, sensible aux problèmes de calibration.
+    for _, meta in windows.iterrows():
+        start, end = float(meta['start_eyelink_ms']), float(meta['end_eyelink_ms'])
+        win = segment(start, end)
+        b_start, b_end = meta['baseline_start_eyelink_ms'], meta['baseline_end_eyelink_ms']
+        base = segment(b_start, b_end)
+        q = _qc_segment(win, start, end, cfg)
+        bq = _qc_segment(base, b_start, b_end, cfg)
+        baseline_valid = (bq['observed_valid_fraction'] >= cfg.min_observed_fraction_baseline
+                          and bq['acquisition_missing_fraction'] <= cfg.max_baseline_missing_fraction
+                          and bq['n_samples'] > 0)
+        baseline = float(base.loc[base['pupil_observed_valid'], 'pupil_clean'].median()) if baseline_valid else np.nan
+        trial_invalid = bool(meta['timeout']) or bool(meta['is_resumed'])
+        common_reasons = []
+        if trial_invalid: common_reasons.append('timeout_or_resumed')
+        if not bool(meta['duration_valid']): common_reasons.append('window_too_short')
+        if q['n_samples'] == 0: common_reasons.append('no_samples')
+        if q['sampling_coverage_fraction'] < 1-cfg.max_window_missing_sampling_fraction:
+            common_reasons.append('missing_sampling_coverage')
+        common_ok = not common_reasons
+        pupil_reasons = common_reasons.copy()
+        if q['observed_valid_fraction'] < cfg.min_observed_fraction_window:
+            pupil_reasons.append('low_observed_pupil_fraction')
+        if q['interpolated_fraction'] > cfg.max_interpolated_fraction_window:
+            pupil_reasons.append('excessive_pupil_interpolation')
+        if q['longest_gap_ms'] > cfg.max_longest_gap_window_ms:
+            pupil_reasons.append('long_artifact_gap')
+        pupil_ok = not pupil_reasons
+        gaze_ok = common_ok and q['gaze_valid_fraction'] >= cfg.min_gaze_valid_fraction
+        # Uniquement les métriques soustractives et AUC dépendent de la baseline.
+        baseline_metrics = {'pupil_baseline_corrected', 'pupil_auc'}
+        for name, metric in METRIC_REGISTRY.items():
+            reason = list(pupil_reasons) if name in pupil_metrics else list(common_reasons)
+            if name in gaze_metrics and not gaze_ok:
+                reason.append('low_valid_gaze_fraction')
+            if name in baseline_metrics and not baseline_valid:
+                reason.append('invalid_baseline')
+            if name == 'gaze_aversion_fraction' and (cfg.cue_roi_center_x is None or cfg.cue_roi_center_y is None):
+                reason.append('roi_not_configured')
+            if name == 'microsaccade_rate_per_s':
+                reason.append('exploratory_small_saccades_not_validated')
+            # Blinks et saccades calculables même avec une pupille partiellement invalide.
+            ok = not reason
+            value = metric(win, baseline, blink_intervals, events, cfg) if ok else np.nan
+            rows.append({
+                'subject_id':meta['subject_id'], 'run_id':meta['run_id'],
+                'trial_n':meta['trial_n'], 'induction_block_id':meta['induction_block_id'],
+                'moment':meta['moment'], 'window_x_s':meta['window_x_s'],
+                'metric':name, 'value':value, 'moment_valid':bool(ok),
+                'moment_exclusion_reason':';'.join(dict.fromkeys(reason)),
+                'pupil_window_valid':bool(pupil_ok), 'gaze_window_valid':bool(gaze_ok),
+                'baseline_valid':bool(baseline_valid),
+                'missing_fraction_window':q['acquisition_missing_fraction'],
+                'baseline_value':baseline,
+                'baseline_missing_fraction':bq['acquisition_missing_fraction'],
+                'baseline_observed_valid_fraction':bq['observed_valid_fraction'],
+                'actual_duration_s':meta['actual_duration_s'],
+                'observed_valid_fraction':q['observed_valid_fraction'],
+                'artifact_fraction':q['artifact_fraction'],
+                'interpolated_fraction':q['interpolated_fraction'],
+                'gaze_valid_fraction':q['gaze_valid_fraction'],
+                'sampling_coverage_fraction':q['sampling_coverage_fraction'],
+                'longest_gap_ms':q['longest_gap_ms'],
+                'stim_id':meta.get('stim_id', np.nan),
+                'stim_image':meta.get('stim_image', np.nan),
+                'stim_sound':meta.get('stim_sound', np.nan),
+                'trial_n_global':meta.get('trial_n_global', np.nan),
+                'cue_text':meta.get('cues', np.nan),
+                'group_5cat':meta['group_5cat'], 'group_valence':meta['group_valence'],
+                'group_arousal':meta['group_arousal'],
+                'emo_grid_valence':meta.get('emo_grid_valence', np.nan),
+                'emo_grid_arousal':meta.get('emo_grid_arousal', np.nan),
+                'LTask_rating':meta.get('LTask_rating', np.nan),
+                'fgat_search_duration_s': (float(meta['fgat_input_time'])-float(meta['fgat_cue_onset'])
+                     if pd.notna(meta.get('fgat_input_time')) and pd.notna(meta.get('fgat_cue_onset')) else np.nan),
+                'LTask_response_duration_s': (float(meta['LTask_validation'])-float(meta['LTask_onset'])
+                     if pd.notna(meta.get('LTask_validation')) and pd.notna(meta.get('LTask_onset')) else np.nan),
+            })
     return pd.DataFrame(rows)
 
 
@@ -564,8 +567,9 @@ def extract_h4_gaze_samples(
                 window_meta["end_eyelink_ms"],
                 inclusive="both",
             )
-        ][["timestamp_ms", "gaze_x", "gaze_y"]].dropna()
+        ][["timestamp_ms", "gaze_x_clean", "gaze_y_clean", "gaze_valid"]].dropna()
 
+        gaze = gaze.loc[gaze["gaze_valid"]].copy()
         if gaze.empty:
             continue
 
@@ -584,6 +588,8 @@ def extract_h4_gaze_samples(
         gaze["group_valence"] = window_meta["group_valence"]
         gaze["group_arousal"] = window_meta["group_arousal"]
 
+        gaze = gaze.rename(columns={"gaze_x_clean": "gaze_x", "gaze_y_clean": "gaze_y"})
+        gaze["sample_weight"] = 1.0 / max(len(gaze), 1)
         rows.append(gaze)
 
     if not rows:

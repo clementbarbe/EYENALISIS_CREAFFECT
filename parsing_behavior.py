@@ -168,6 +168,7 @@ def parse_behavior_csv(
                 "emo_stim_onset",
                 "emo_grid_valence",
                 "emo_grid_arousal",
+                "stim_id", "stim_image", "stim_sound",
             ]
         ]
         .first()
@@ -177,6 +178,9 @@ def parse_behavior_csv(
                 "emo_stim_onset": "block_emo_stim_onset",
                 "emo_grid_valence": "block_emo_grid_valence",
                 "emo_grid_arousal": "block_emo_grid_arousal",
+                "stim_id": "block_stim_id",
+                "stim_image": "block_stim_image",
+                "stim_sound": "block_stim_sound",
             }
         )
     )
@@ -193,6 +197,8 @@ def parse_behavior_csv(
     trials["emo_stim_onset"] = trials["block_emo_stim_onset"]
     trials["emo_grid_valence"] = trials["block_emo_grid_valence"]
     trials["emo_grid_arousal"] = trials["block_emo_grid_arousal"]
+    for key in ("stim_id", "stim_image", "stim_sound"):
+        trials[key] = trials["block_" + key]
 
     trials["group_5cat"] = trials["stim_category"]
 

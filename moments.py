@@ -209,6 +209,17 @@ def build_moment_windows(
                 cfg=cfg,
             )
 
+            # Sensibilité H2 sans 200 dernières ms de préparation / clic moteur.
+            motor_end = max(cue, idea_time - cfg.pre_idea_motor_exclusion_s)
+            no_motor = _create_window(
+                moment="H2_pre_idea_without_motor",
+                start_s=max(cue, motor_end - cfg.fixed_pre_idea_window_s),
+                end_s=motor_end,
+                requested_duration_s=cfg.fixed_pre_idea_window_s,
+                cfg=cfg,
+            )
+            _append_window(rows, trial, no_motor, *baseline, timing, sync)
+
             # H4 : période entière cue -> clic idée, pour les heatmaps gaze.
             full_search_window = _create_window(
                 moment="H4_full_search_gaze",
@@ -271,12 +282,16 @@ def build_moment_windows(
             )
 
             _append_window(
-                rows,
-                trial,
-                liking_window,
-                *baseline,
-                timing,
-                sync,
+                rows, trial, liking_window, *baseline, timing, sync,
             )
+            # Sensibilité: évaluation initiale au plus 1 s, sans mouvement.
+            if pd.notna(first_movement):
+                fixed = _create_window(
+                    moment="H3_liking_first_1s_pre_move",
+                    start_s=ltask_onset,
+                    end_s=min(ltask_onset + cfg.liking_fixed_window_s, float(first_movement)),
+                    requested_duration_s=cfg.liking_fixed_window_s, cfg=cfg,
+                )
+                _append_window(rows, trial, fixed, *baseline, timing, sync)
 
     return pd.DataFrame(rows)
