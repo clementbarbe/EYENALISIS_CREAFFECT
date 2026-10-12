@@ -1,4 +1,12 @@
-"""Prétraitement pupillométrique."""
+"""Prétraitement pupillométrique inspiré de Kret & Sjak-Shie (2019).
+
+Important
+---------
+La vitesse pupillaire est utilisée comme information complémentaire autour
+des trous de signal, et non comme une règle globale supprimant tout échantillon
+dont la dérivée est élevée. Cela évite de transformer des fluctuations normales
+à 1000 Hz en dizaines de pourcents de données manquantes.
+"""
 
 from __future__ import annotations
 
@@ -9,53 +17,73 @@ from scipy.signal import butter, filtfilt
 from config import Config
 
 
-def _mad_outlier_mask(
-    signal: pd.Series,
+def _robust_outlier_mask(
+    values: pd.Series,
     threshold: float,
 ) -> np.ndarray:
-    """Détecte les valeurs aberrantes avec MAD."""
-    valid = signal.dropna()
+    """Détecte les outliers robustes par MAD."""
+    valid = values.dropna()
 
     if valid.empty:
-        return np.zeros(len(signal), dtype=bool)
+        return np.zeros(len(values), dtype=bool)
 
     median = valid.median()
     mad = np.median(np.abs(valid - median))
 
-    if mad <= 0 or not np.isfinite(mad):
-        return np.zeros(len(signal), dtype=bool)
+    if not np.isfinite(mad) or mad <= 0:
+        return np.zeros(len(values), dtype=bool)
 
-    robust_z = 0.6745 * (signal - median) / mad
+    robust_z = 0.6745 * (values - median) / mad
 
     return (
         robust_z.abs() > threshold
     ).fillna(False).to_numpy()
 
 
-def _blink_mask_from_events(
+def _pupil_speed_artifact_mask(
+    pupil: pd.Series,
+    timestamps_ms: pd.Series,
+    cfg: Config,
+) -> np.ndarray:
+    """
+    Détecte des vitesses pupillaires anormalement fortes.
+
+    Cette fonction ne doit pas être utilisée seule comme masque de blink global.
+    Elle sert uniquement à identifier des artefacts proches des trous du signal.
+    """
+    dt_s = timestamps_ms.diff() / 1000.0
+    dp = pupil.diff()
+
+    speed = (dp / dt_s).abs()
+    speed = speed.replace([np.inf, -np.inf], np.nan)
+
+    return _robust_outlier_mask(
+        speed,
+        cfg.pupil_speed_mad_threshold,
+    )
+
+
+def _event_blink_mask(
     samples: pd.DataFrame,
     events: pd.DataFrame,
     cfg: Config,
 ) -> np.ndarray:
-    """Masque les fenêtres EBLINK avec padding."""
+    """Construit un masque à partir des événements EBLINK, s'ils existent."""
     mask = np.zeros(len(samples), dtype=bool)
 
-    if events.empty:
+    if events.empty or "event_type" not in events.columns:
         return mask
 
-    blinks = events.loc[
+    blink_events = events.loc[
         events["event_type"] == "EBLINK"
     ]
 
-    for _, blink in blinks.iterrows():
-        start_ms = blink.get("start_ms", np.nan)
-        end_ms = blink.get("end_ms", np.nan)
+    for _, event in blink_events.iterrows():
+        start_ms = event.get("start_ms", np.nan)
+        end_ms = event.get("end_ms", np.nan)
 
         if pd.isna(start_ms) or pd.isna(end_ms):
             continue
-
-        start_ms -= cfg.blink_padding_before_ms
-        end_ms += cfg.blink_padding_after_ms
 
         mask |= samples["timestamp_ms"].between(
             start_ms,
@@ -66,40 +94,84 @@ def _blink_mask_from_events(
     return mask
 
 
-def _fallback_drop_mask(
-    pupil: pd.Series,
-    cfg: Config,
+def _expand_contiguous_segments(
+    mask: np.ndarray,
+    timestamps_ms: np.ndarray,
+    before_ms: int,
+    after_ms: int,
 ) -> np.ndarray:
     """
-    Détection défensive d'artefacts brusques si EBLINK absent.
+    Étend chaque segment CONTIGU d'artefact.
 
-    Ce n'est pas une détection parfaite des clignements, mais elle aide
-    à exclure les chutes/retours extrêmement abrupts du signal.
+    Contrairement à l'ancien code, on n'étend pas séparément chaque échantillon.
+    Cela évite d'ajouter +/-100 ms des milliers de fois.
     """
-    derivative = pupil.diff().abs()
-    valid_derivative = derivative.dropna()
+    expanded = mask.copy()
 
-    if valid_derivative.empty:
-        return np.zeros(len(pupil), dtype=bool)
+    if not mask.any():
+        return expanded
 
-    median = valid_derivative.median()
-    mad = np.median(np.abs(valid_derivative - median))
+    start = 0
 
-    if mad <= 0 or not np.isfinite(mad):
-        return np.zeros(len(pupil), dtype=bool)
+    while start < len(mask):
+        if not mask[start]:
+            start += 1
+            continue
 
-    robust_z = 0.6745 * (derivative - median) / mad
+        end = start
 
-    return (
-        robust_z.abs() > cfg.pupil_drop_mad_threshold
-    ).fillna(False).to_numpy()
+        while end < len(mask) and mask[end]:
+            end += 1
+
+        segment_start_ms = timestamps_ms[start]
+        segment_end_ms = timestamps_ms[end - 1]
+
+        expanded |= (
+            (timestamps_ms >= segment_start_ms - before_ms)
+            & (timestamps_ms <= segment_end_ms + after_ms)
+        )
+
+        start = end
+
+    return expanded
+
+
+def _mask_speed_near_missing_segments(
+    speed_mask: np.ndarray,
+    missing_mask: np.ndarray,
+    timestamps_ms: np.ndarray,
+    vicinity_ms: int = 150,
+) -> np.ndarray:
+    """
+    Ne conserve les artefacts de vitesse que proches d'un vrai trou de signal.
+
+    Un changement rapide de pupille peut être physiologique ou être du bruit.
+    Il n'est traité comme artefact de blink que s'il est proche d'une période
+    réellement invalide/manquante.
+    """
+    if not speed_mask.any() or not missing_mask.any():
+        return np.zeros(len(speed_mask), dtype=bool)
+
+    nearby_missing = np.zeros(len(missing_mask), dtype=bool)
+
+    missing_indices = np.flatnonzero(missing_mask)
+
+    for index in missing_indices:
+        timestamp = timestamps_ms[index]
+
+        nearby_missing |= (
+            (timestamps_ms >= timestamp - vicinity_ms)
+            & (timestamps_ms <= timestamp + vicinity_ms)
+        )
+
+    return speed_mask & nearby_missing
 
 
 def _interpolate_short_gaps(
     signal: pd.Series,
     max_gap_samples: int,
 ) -> pd.Series:
-    """Interpole uniquement les trous courts."""
+    """Interpole linéairement les trous courts uniquement."""
     output = signal.copy()
     missing = output.isna().to_numpy()
 
@@ -135,16 +207,16 @@ def _interpolate_short_gaps(
     return output
 
 
-def _filter_segments(
+def _filter_valid_segments(
     signal: pd.Series,
     cfg: Config,
 ) -> pd.Series:
-    """Applique un filtre passe-bas séparément aux segments valides."""
+    """Applique un filtre passe-bas aux segments continus valides."""
     if not cfg.lowpass_enabled:
         return signal
 
     output = signal.copy()
-    valid = output.notna().to_numpy()
+    valid_mask = output.notna().to_numpy()
 
     nyquist = cfg.sampling_rate_hz / 2.0
     normalized_cutoff = cfg.lowpass_cutoff_hz / nyquist
@@ -155,23 +227,23 @@ def _filter_segments(
         btype="low",
     )
 
-    min_segment_length = 3 * max(len(a), len(b))
+    minimum_length = 3 * max(len(a), len(b))
 
     start = 0
 
     while start < len(output):
-        if not valid[start]:
+        if not valid_mask[start]:
             start += 1
             continue
 
         end = start
 
-        while end < len(output) and valid[end]:
+        while end < len(output) and valid_mask[end]:
             end += 1
 
         segment = output.iloc[start:end].to_numpy(dtype=float)
 
-        if len(segment) >= min_segment_length:
+        if len(segment) >= minimum_length:
             try:
                 output.iloc[start:end] = filtfilt(b, a, segment)
             except ValueError:
@@ -182,63 +254,165 @@ def _filter_segments(
     return output
 
 
+def _make_blink_intervals(
+    blink_mask: np.ndarray,
+    timestamps_ms: np.ndarray,
+) -> pd.DataFrame:
+    """Transforme le masque de blink en tableau d'intervalles."""
+    rows: list[dict] = []
+
+    start = 0
+
+    while start < len(blink_mask):
+        if not blink_mask[start]:
+            start += 1
+            continue
+
+        end = start
+
+        while end < len(blink_mask) and blink_mask[end]:
+            end += 1
+
+        start_ms = timestamps_ms[start]
+        end_ms = timestamps_ms[end - 1]
+
+        rows.append(
+            {
+                "blink_start_ms": start_ms,
+                "blink_end_ms": end_ms,
+                "blink_duration_ms": end_ms - start_ms,
+            }
+        )
+
+        start = end
+
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "blink_start_ms",
+            "blink_end_ms",
+            "blink_duration_ms",
+        ],
+    )
+
+
 def preprocess_pupil(
     samples: pd.DataFrame,
     events: pd.DataFrame,
     cfg: Config,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Produit le signal pupillaire nettoyé.
+    Nettoie le signal pupillaire.
 
-    pupil_missing_raw :
-        Indique les valeurs invalides avant interpolation.
-    pupil_clean :
-        Signal interpolé et filtré.
+    Returns
+    -------
+    preprocessed:
+        Contient :
+        - pupil_missing_acquisition : trous réellement présents dans le fichier ;
+        - pupil_missing_qc : trous + fenêtres de blink ;
+        - pupil_clean : signal interpolé/filtré ;
+        - blink_mask : masque utilisé pour taux de blink.
+
+    blink_intervals:
+        Tableau des épisodes de blink identifiés.
     """
     df = samples.copy().sort_values(
         "timestamp_ms"
     ).reset_index(drop=True)
 
-    if df.empty:
-        return df
+    empty_blinks = pd.DataFrame(
+        columns=[
+            "blink_start_ms",
+            "blink_end_ms",
+            "blink_duration_ms",
+        ]
+    )
 
-    pupil = pd.to_numeric(
+    if df.empty:
+        return df, empty_blinks
+
+    pupil_raw = pd.to_numeric(
         df["pupil_size"],
         errors="coerce",
     )
 
-    invalid_mask = pupil.isna() | (
-        pupil <= cfg.min_plausible_pupil
-    )
+    timestamps = df["timestamp_ms"].to_numpy(dtype=float)
 
-    blink_mask = _blink_mask_from_events(
+    # 1. Données réellement manquantes/inexploitables dans le fichier EyeLink.
+    acquisition_missing_mask = (
+        pupil_raw.isna()
+        | (pupil_raw <= cfg.min_plausible_pupil)
+    ).to_numpy()
+
+    # 2. EBLINK éventuels : complément.
+    event_blink_mask = _event_blink_mask(
         df,
         events,
         cfg,
     )
 
-    pupil.loc[invalid_mask | blink_mask] = np.nan
+    # 3. Détection de vitesse élevée, mais elle n'est utilisée qu'autour
+    # de vrais trous de tracking.
+    speed_mask = _pupil_speed_artifact_mask(
+        pupil_raw,
+        df["timestamp_ms"],
+        cfg,
+    )
 
-    # Fallback si les EBLINK sont absents.
-    if not (events["event_type"] == "EBLINK").any():
-        drop_mask = _fallback_drop_mask(pupil, cfg)
-        pupil.loc[drop_mask] = np.nan
-    else:
-        drop_mask = np.zeros(len(pupil), dtype=bool)
+    speed_near_missing_mask = _mask_speed_near_missing_segments(
+        speed_mask=speed_mask,
+        missing_mask=acquisition_missing_mask,
+        timestamps_ms=timestamps,
+        vicinity_ms=150,
+    )
 
-    outlier_mask = _mad_outlier_mask(
-        pupil,
+    # 4. Blinks initiaux : vrais trous + tags EyeLink + vitesse près d'un trou.
+    initial_blink_mask = (
+        acquisition_missing_mask
+        | event_blink_mask
+        | speed_near_missing_mask
+    )
+
+    # 5. Padding seulement une fois par segment continu.
+    blink_mask = _expand_contiguous_segments(
+        mask=initial_blink_mask,
+        timestamps_ms=timestamps,
+        before_ms=cfg.blink_padding_before_ms,
+        after_ms=cfg.blink_padding_after_ms,
+    )
+
+    pupil_for_processing = pupil_raw.copy()
+    pupil_for_processing.loc[blink_mask] = np.nan
+
+    # 6. Outliers restants : ils sont retirés du signal, mais on les stocke
+    # séparément. Ils ne gonflent pas automatiquement le taux QC run.
+    residual_outlier_mask = _robust_outlier_mask(
+        pupil_for_processing,
         cfg.pupil_outlier_mad_threshold,
     )
 
-    pupil.loc[outlier_mask] = np.nan
+    pupil_for_processing.loc[residual_outlier_mask] = np.nan
 
-    df["pupil_missing_raw"] = pupil.isna()
-    df["blink_or_invalid"] = (
-        invalid_mask
-        | blink_mask
-        | drop_mask
-        | outlier_mask
+    # QC acquisition : ce qui était réellement manquant dans le fichier.
+    df["pupil_missing_acquisition"] = acquisition_missing_mask
+
+    # QC fenêtre : acquisition + blink padding.
+    # Les outliers résiduels restent dans une colonne séparée.
+    df["pupil_missing_qc"] = blink_mask
+
+    # Compatibilité avec les autres modules actuels :
+    # le pipeline utilise cette colonne pour exclusion fenêtre.
+    df["pupil_missing_raw"] = df["pupil_missing_qc"]
+
+    df["blink_mask"] = blink_mask
+    df["event_blink_mask"] = event_blink_mask
+    df["speed_artifact_mask"] = speed_mask
+    df["speed_near_missing_mask"] = speed_near_missing_mask
+    df["residual_outlier_mask"] = residual_outlier_mask
+
+    blink_intervals = _make_blink_intervals(
+        blink_mask,
+        timestamps,
     )
 
     max_gap_samples = int(
@@ -248,13 +422,13 @@ def preprocess_pupil(
     )
 
     interpolated = _interpolate_short_gaps(
-        pupil,
-        max_gap_samples,
+        pupil_for_processing,
+        max_gap_samples=max_gap_samples,
     )
 
-    df["pupil_clean"] = _filter_segments(
+    df["pupil_clean"] = _filter_valid_segments(
         interpolated,
         cfg,
     )
 
-    return df
+    return df, blink_intervals

@@ -1,4 +1,4 @@
-"""Analyses statistiques : blocs d'induction, modèles mixtes et FDR."""
+"""Analyses statistiques confirmatoires FGAT."""
 
 from __future__ import annotations
 
@@ -18,93 +18,55 @@ GROUP_SCHEMES = {
     "arousal": "group_arousal",
 }
 
-# Les métriques QC / regard ne participent pas à la FDR pupillométrique.
-PRIMARY_PUPIL_METRICS = {
-    "pupil_mean",
-    "pupil_sd",
-    "pupil_baseline_corrected",
-    "pupil_slope_per_s",
-    "pupil_auc",
-    "pupil_peak",
-    "pupil_peak_latency_s",
+
+HYPOTHESES = {
+    "H1_induction_emotion": {
+        "moment": "H1_induction_late",
+        "metrics": [
+            "pupil_baseline_corrected",
+            "pupil_mean",
+            "saccade_rate_per_s",
+            "all_saccade_rate_per_s",
+        ],
+        "schemes": [
+            "five_categories",
+            "valence",
+            "arousal",
+        ],
+        "rating_model": False,
+    },
+    "H2_pre_idea": {
+        "moment": "H2_pre_idea",
+        "metrics": [
+            "pupil_baseline_corrected",
+            "pupil_mean",
+        ],
+        "schemes": [
+            "five_categories",
+            "valence",
+            "arousal",
+        ],
+        "rating_model": False,
+    },
+    "H3_liking": {
+        "moment": "H3_liking",
+        "metrics": [
+            "pupil_baseline_corrected",
+            "pupil_mean",
+        ],
+        "schemes": [
+            "five_categories",
+        ],
+        "rating_model": True,
+    },
 }
 
 
-def aggregate_to_induction_blocks(
-    metrics_long: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Agrège les essais d'un même bloc d'induction.
-
-    Les trois essais d'un bloc partagent la même induction émotionnelle.
-    Pour M2/M3, ils sont donc moyennés avant l'analyse statistique.
-
-    Niveau final :
-        sujet × run × induction_block × moment × X × métrique.
-    """
-    valid = metrics_long.loc[
-        metrics_long["moment_valid"]
-        & metrics_long["value"].notna()
-    ].copy()
-
-    grouping_columns = [
-        "subject_id",
-        "run_id",
-        "induction_block_id",
-        "moment",
-        "window_x_s",
-        "metric",
-        "group_5cat",
-        "group_valence",
-        "group_arousal",
-    ]
-
-    aggregation = {
-        "value": "mean",
-        "trial_n": "count",
-        "missing_fraction_window": "mean",
-        "actual_duration_s": "mean",
-        "emo_grid_valence": "mean",
-        "emo_grid_arousal": "mean",
-        "LTask_rating": "mean",
-    }
-
-    block_data = (
-        valid.groupby(
-            grouping_columns,
-            as_index=False,
-            dropna=False,
-        )
-        .agg(aggregation)
-        .rename(
-            columns={
-                "value": "value_block_mean",
-                "trial_n": "n_valid_trials_in_block",
-                "missing_fraction_window": "mean_missing_fraction",
-                "actual_duration_s": "mean_window_duration_s",
-            }
-        )
-    )
-
-    block_data["value"] = block_data["value_block_mean"]
-
-    return block_data
-
-
-def _count_subjects_with_multiple_levels(
-    data: pd.DataFrame,
-    group_column: str,
-) -> int:
-    """Compte les sujets ayant au moins deux niveaux de condition."""
-    levels = data.groupby("subject_id")[group_column].nunique()
-    return int((levels >= 2).sum())
-
-
-def _fit_mixedlm_with_retries(
+def _fit_mixed_model(
     formula: str,
     data: pd.DataFrame,
-) -> tuple[object | None, list[str], str | None]:
-    """Ajuste MixedLM avec plusieurs optimiseurs."""
+) -> tuple[object | None, str, list[str]]:
+    """Ajuste un MixedLM avec plusieurs optimiseurs."""
     optimizers = ["lbfgs", "bfgs", "cg", "powell"]
 
     for optimizer in optimizers:
@@ -129,293 +91,322 @@ def _fit_mixedlm_with_retries(
             messages = [str(w.message) for w in caught]
 
             if bool(fit.converged):
-                return fit, messages, optimizer
+                return fit, optimizer, messages
 
         except Exception:
             continue
 
-    return None, [], None
+    return None, "", []
 
 
-def _has_critical_warning(
-    warning_messages: list[str],
-) -> bool:
-    """Détecte les warnings invalidant l'inférence Wald."""
+def _has_critical_warning(messages: list[str]) -> bool:
+    """Détecte les warnings rendant les p-values incertaines."""
     critical_patterns = [
-        "Hessian matrix at the estimated parameter values is not positive definite",
-        "Maximum Likelihood optimization failed to converge",
-        "MixedLM optimization failed",
-        "Gradient optimization failed",
+        "hessian matrix",
+        "optimization failed",
+        "failed to converge",
+        "gradient optimization failed",
     ]
 
     return any(
-        any(
-            pattern.lower() in message.lower()
-            for pattern in critical_patterns
-        )
-        for message in warning_messages
+        any(pattern in message.lower() for pattern in critical_patterns)
+        for message in messages
     )
 
 
-def _is_singular_random_effect(
+def _global_factor_pvalue(
     fit: object,
-    tolerance: float = 1e-8,
-) -> bool:
-    """Indique si la variance inter-sujet est quasi nulle."""
+    factor_name: str,
+) -> tuple[float, str, float, float]:
+    """Retourne p-value globale Wald et contraste le plus fort."""
+    terms = [
+        name
+        for name in fit.params.index
+        if name.startswith(f"C({factor_name})")
+    ]
+
+    if not terms:
+        return np.nan, "", np.nan, np.nan
+
+    indices = [
+        fit.params.index.get_loc(term)
+        for term in terms
+    ]
+
+    restriction = np.zeros(
+        (len(indices), len(fit.params))
+    )
+
+    for i, parameter_index in enumerate(indices):
+        restriction[i, parameter_index] = 1.0
+
     try:
-        covariance = np.asarray(fit.cov_re, dtype=float)
+        test = fit.wald_test(restriction, scalar=True)
+    except TypeError:
+        test = fit.wald_test(restriction)
 
-        if covariance.size == 0:
-            return True
+    strongest_term = fit.params[terms].abs().idxmax()
 
-        diagonal = np.diag(covariance)
-
-        return bool(
-            np.any(~np.isfinite(diagonal))
-            or np.any(diagonal < tolerance)
-        )
-
-    except Exception:
-        return True
+    return (
+        float(np.asarray(test.pvalue).squeeze()),
+        strongest_term,
+        float(fit.params[strongest_term]),
+        float(fit.bse[strongest_term]),
+    )
 
 
-def fit_mixed_models(
+def _rating_pvalue(
+    fit: object,
+) -> tuple[float, float, float]:
+    """Retourne p-value, coefficient et SE du rating liking."""
+    if "LTask_rating_z" not in fit.params.index:
+        return np.nan, np.nan, np.nan
+
+    return (
+        float(fit.pvalues["LTask_rating_z"]),
+        float(fit.params["LTask_rating_z"]),
+        float(fit.bse["LTask_rating_z"]),
+    )
+
+
+def run_confirmatory_models(
     metrics_long: pd.DataFrame,
     cfg: Config,
 ) -> pd.DataFrame:
     """
-    Ajuste un modèle mixte par schéma × moment × métrique × X.
+    Lance les analyses H1, H2 et H3.
 
-    Modèle :
-        value_z ~ C(condition) + C(run_id) + (1 | subject_id)
+    H1:
+        Catégorie émotionnelle -> pupille et saccades pendant induction tardive.
 
-    Les analyses sont faites au niveau des blocs d'induction,
-    pas au niveau des essais bruts.
+    H2:
+        Catégorie émotionnelle -> pupille juste avant idée.
+
+    H3:
+        Pupille pendant évaluation liking ~ rating continu + catégorie.
     """
-    results: list[dict] = []
+    rows: list[dict] = []
 
-    block_metrics = aggregate_to_induction_blocks(metrics_long)
-
-    valid = block_metrics.loc[
-        block_metrics["metric"].isin(PRIMARY_PUPIL_METRICS)
-        & block_metrics["value"].notna()
+    valid = metrics_long.loc[
+        metrics_long["moment_valid"]
+        & metrics_long["value"].notna()
     ].copy()
 
-    for scheme_name, group_column in GROUP_SCHEMES.items():
-        grouped = valid.groupby(
-            ["moment", "metric", "window_x_s"],
-            dropna=False,
-        )
+    for hypothesis_name, spec in HYPOTHESES.items():
+        for scheme_name in spec["schemes"]:
+            group_column = GROUP_SCHEMES[scheme_name]
 
-        for (moment, metric, window_x_s), data in grouped:
-            data = data.dropna(
-                subset=[
+            subset = valid.loc[
+                (valid["moment"] == spec["moment"])
+                & valid["metric"].isin(spec["metrics"])
+            ].copy()
+
+            for metric_name, data in subset.groupby("metric"):
+                required = [
                     "subject_id",
                     "run_id",
                     group_column,
                     "value",
                 ]
-            ).copy()
 
-            n_rows = len(data)
-            n_subjects = data["subject_id"].nunique()
-            n_levels = data[group_column].nunique()
+                if spec["rating_model"]:
+                    required.append("LTask_rating")
 
-            n_subjects_multilevel = (
-                _count_subjects_with_multiple_levels(
-                    data,
-                    group_column,
-                )
-            )
+                data = data.dropna(subset=required).copy()
 
-            base = {
-                "scheme": scheme_name,
-                "group_column": group_column,
-                "moment": moment,
-                "metric": metric,
-                "window_x_s": window_x_s,
-                "n_induction_blocks": n_rows,
-                "n_subjects": n_subjects,
-                "n_levels": n_levels,
-                "n_subjects_with_multiple_group_levels": n_subjects_multilevel,
-                "model_success": False,
-                "model_reliable": False,
-                "optimizer": "",
-                "random_effect_singular": np.nan,
-                "p_raw": np.nan,
-                "p_fdr": np.nan,
-                "significant_fdr": False,
-                "effect_size_std_max_contrast": np.nan,
-                "ci_low_std": np.nan,
-                "ci_high_std": np.nan,
-                "aic": np.nan,
-                "warning_messages": "",
-                "error": "",
-            }
+                result = {
+                    "hypothesis": hypothesis_name,
+                    "scheme": scheme_name,
+                    "group_column": group_column,
+                    "moment": spec["moment"],
+                    "metric": metric_name,
+                    "n_rows": len(data),
+                    "n_subjects": data["subject_id"].nunique(),
+                    "n_levels": data[group_column].nunique(),
+                    "model_reliable": False,
+                    "optimizer": "",
+                    "p_group_raw": np.nan,
+                    "p_group_fdr": np.nan,
+                    "group_significant_fdr": False,
+                    "strongest_group_contrast": "",
+                    "group_effect_std": np.nan,
+                    "group_ci_low_std": np.nan,
+                    "group_ci_high_std": np.nan,
+                    "p_rating_raw": np.nan,
+                    "p_rating_fdr": np.nan,
+                    "rating_significant_fdr": False,
+                    "rating_effect_std": np.nan,
+                    "rating_ci_low_std": np.nan,
+                    "warning_messages": "",
+                    "error": "",
+                }
 
-            if n_rows < cfg.min_rows_for_model:
-                base["error"] = "insufficient_induction_blocks"
-                results.append(base)
-                continue
-
-            if n_subjects < cfg.min_subjects_for_model:
-                base["error"] = "insufficient_subjects"
-                results.append(base)
-                continue
-
-            if n_levels < cfg.min_levels_for_model:
-                base["error"] = "insufficient_group_levels"
-                results.append(base)
-                continue
-
-            if n_subjects_multilevel < 2:
-                base["error"] = "insufficient_within_subject_group_variation"
-                results.append(base)
-                continue
-
-            value_sd = float(data["value"].std(ddof=1))
-
-            if not np.isfinite(value_sd) or value_sd <= 1e-12:
-                base["error"] = "near_constant_metric"
-                results.append(base)
-                continue
-
-            # Standardisation uniquement pour améliorer la stabilité numérique.
-            data["value_z"] = (
-                data["value"] - data["value"].mean()
-            ) / value_sd
-
-            formula = f"value_z ~ C({group_column}) + C(run_id)"
-
-            fit, messages, optimizer = _fit_mixedlm_with_retries(
-                formula,
-                data,
-            )
-
-            base["optimizer"] = optimizer or ""
-            base["warning_messages"] = " | ".join(messages)
-
-            if fit is None:
-                base["error"] = "mixedlm_failed_to_converge"
-                results.append(base)
-                continue
-
-            if _has_critical_warning(messages):
-                base["error"] = "unreliable_hessian_or_convergence_warning"
-                results.append(base)
-                continue
-
-            try:
-                group_terms = [
-                    term
-                    for term in fit.params.index
-                    if term.startswith(f"C({group_column})")
-                ]
-
-                if not group_terms:
-                    base["error"] = "no_estimable_group_contrast"
-                    results.append(base)
+                if len(data) < cfg.min_rows_for_model:
+                    result["error"] = "insufficient_rows"
+                    rows.append(result)
                     continue
 
-                parameter_indices = [
-                    fit.params.index.get_loc(term)
-                    for term in group_terms
-                ]
+                if data["subject_id"].nunique() < cfg.min_subjects_for_model:
+                    result["error"] = "insufficient_subjects"
+                    rows.append(result)
+                    continue
 
-                restriction = np.zeros(
-                    (len(parameter_indices), len(fit.params))
+                if data[group_column].nunique() < cfg.min_levels_for_model:
+                    result["error"] = "insufficient_group_levels"
+                    rows.append(result)
+                    continue
+
+                value_sd = float(data["value"].std(ddof=1))
+
+                if not np.isfinite(value_sd) or value_sd <= 1e-12:
+                    result["error"] = "near_constant_metric"
+                    rows.append(result)
+                    continue
+
+                data["value_z"] = (
+                    data["value"] - data["value"].mean()
+                ) / value_sd
+
+                if spec["rating_model"]:
+                    rating_sd = float(
+                        data["LTask_rating"].std(ddof=1)
+                    )
+
+                    if (
+                        not np.isfinite(rating_sd)
+                        or rating_sd <= 1e-12
+                    ):
+                        result["error"] = "near_constant_rating"
+                        rows.append(result)
+                        continue
+
+                    data["LTask_rating_z"] = (
+                        data["LTask_rating"]
+                        - data["LTask_rating"].mean()
+                    ) / rating_sd
+
+                    formula = (
+                        f"value_z ~ C({group_column}) "
+                        "+ LTask_rating_z + C(run_id)"
+                    )
+                else:
+                    formula = (
+                        f"value_z ~ C({group_column}) + C(run_id)"
+                    )
+
+                fit, optimizer, messages = _fit_mixed_model(
+                    formula,
+                    data,
                 )
 
-                for row_index, parameter_index in enumerate(
-                    parameter_indices
-                ):
-                    restriction[row_index, parameter_index] = 1.0
+                result["optimizer"] = optimizer
+                result["warning_messages"] = " | ".join(messages)
+
+                if fit is None:
+                    result["error"] = "mixedlm_failed"
+                    rows.append(result)
+                    continue
+
+                if _has_critical_warning(messages):
+                    result["error"] = "unreliable_hessian_or_convergence"
+                    rows.append(result)
+                    continue
 
                 try:
-                    wald = fit.wald_test(
-                        restriction,
-                        scalar=True,
+                    (
+                        p_group,
+                        contrast,
+                        estimate,
+                        standard_error,
+                    ) = _global_factor_pvalue(
+                        fit,
+                        group_column,
                     )
-                except TypeError:
-                    wald = fit.wald_test(restriction)
 
-                p_raw = float(np.asarray(wald.pvalue).squeeze())
+                    result.update(
+                        {
+                            "model_reliable": True,
+                            "p_group_raw": p_group,
+                            "strongest_group_contrast": contrast,
+                            "group_effect_std": estimate,
+                            "group_ci_low_std": (
+                                estimate - 1.96 * standard_error
+                            ),
+                            "group_ci_high_std": (
+                                estimate + 1.96 * standard_error
+                            ),
+                        }
+                    )
 
-                parameters = fit.params[group_terms]
-                standard_errors = fit.bse[group_terms]
+                    if spec["rating_model"]:
+                        (
+                            p_rating,
+                            rating_estimate,
+                            rating_standard_error,
+                        ) = _rating_pvalue(fit)
 
-                strongest_term = parameters.abs().idxmax()
+                        result.update(
+                            {
+                                "p_rating_raw": p_rating,
+                                "rating_effect_std": rating_estimate,
+                                "rating_ci_low_std": (
+                                    rating_estimate
+                                    - 1.96 * rating_standard_error
+                                ),
+                                "rating_ci_high_std": (
+                                    rating_estimate
+                                    + 1.96 * rating_standard_error
+                                ),
+                            }
+                        )
 
-                estimate = float(parameters[strongest_term])
-                standard_error = float(
-                    standard_errors[strongest_term]
-                )
+                except Exception as exc:
+                    result["model_reliable"] = False
+                    result["error"] = (
+                        f"post_fit_error: {type(exc).__name__}: {exc}"
+                    )
 
-                base.update(
-                    {
-                        "model_success": True,
-                        "model_reliable": True,
-                        "random_effect_singular": (
-                            _is_singular_random_effect(fit)
-                        ),
-                        "p_raw": p_raw,
-                        "strongest_contrast": strongest_term,
-                        "effect_size_std_max_contrast": estimate,
-                        "ci_low_std": (
-                            estimate - 1.96 * standard_error
-                        ),
-                        "ci_high_std": (
-                            estimate + 1.96 * standard_error
-                        ),
-                        "aic": float(fit.aic),
-                    }
-                )
+                rows.append(result)
 
-            except Exception as exc:
-                base["error"] = (
-                    f"post_fit_error: {type(exc).__name__}: {exc}"
-                )
-                base["model_success"] = False
-                base["model_reliable"] = False
+    results = pd.DataFrame(rows)
 
-            results.append(base)
+    if results.empty:
+        return results
 
-    results_df = pd.DataFrame(results)
+    # Correction FDR pour les tests de catégorie.
+    eligible_group = (
+        results["model_reliable"]
+        & results["p_group_raw"].notna()
+    )
 
-    if results_df.empty:
-        return results_df
-
-    # FDR par schéma.
-    # Chaque famille inclut :
-    # moments × métriques × toutes les valeurs X.
-    for _, indices in results_df.groupby("scheme").groups.items():
-        subset = results_df.loc[indices].copy()
-
-        eligible = (
-            subset["model_success"]
-            & subset["model_reliable"]
-            & subset["p_raw"].notna()
-        )
-
-        if not eligible.any():
-            continue
-
-        rejected, p_corrected, _, _ = multipletests(
-            subset.loc[eligible, "p_raw"].to_numpy(),
+    if eligible_group.any():
+        rejected, corrected, _, _ = multipletests(
+            results.loc[eligible_group, "p_group_raw"],
             alpha=cfg.alpha,
             method=cfg.fdr_method,
         )
 
-        eligible_indices = subset.loc[eligible].index
+        indices = results.loc[eligible_group].index
 
-        results_df.loc[
-            eligible_indices,
-            "p_fdr",
-        ] = p_corrected
+        results.loc[indices, "p_group_fdr"] = corrected
+        results.loc[indices, "group_significant_fdr"] = rejected
 
-        results_df.loc[
-            eligible_indices,
-            "significant_fdr",
-        ] = rejected
+    # Correction FDR séparée pour les tests de rating H3.
+    eligible_rating = (
+        results["model_reliable"]
+        & results["p_rating_raw"].notna()
+    )
 
-    return results_df
+    if eligible_rating.any():
+        rejected, corrected, _, _ = multipletests(
+            results.loc[eligible_rating, "p_rating_raw"],
+            alpha=cfg.alpha,
+            method=cfg.fdr_method,
+        )
+
+        indices = results.loc[eligible_rating].index
+
+        results.loc[indices, "p_rating_fdr"] = corrected
+        results.loc[indices, "rating_significant_fdr"] = rejected
+
+    return results

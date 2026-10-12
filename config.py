@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 
 @dataclass(frozen=True)
 class Config:
-    """Tous les paramètres modifiables du pipeline."""
+    """Paramètres modifiables du pipeline."""
 
     # --------------------------------------------------------------
     # Acquisition EyeLink
@@ -33,8 +33,8 @@ class Config:
     min_plausible_pupil: float = 0.01
     min_unique_pupil_values: int = 20
 
+    pupil_speed_mad_threshold: float = 6.0
     pupil_outlier_mad_threshold: float = 6.0
-    pupil_drop_mad_threshold: float = 8.0
 
     interpolation_max_gap_ms: int = 500
 
@@ -43,44 +43,119 @@ class Config:
     lowpass_order: int = 4
 
     # --------------------------------------------------------------
-    # Exclusions
+    # Exclusions volontairement permissives
     # --------------------------------------------------------------
-    # Seuil confirmé dans le brief : >20% de données invalides => run exclu.
-    max_run_missing_fraction: float = 0.35
+    # Exclusion run seulement si >60% réellement absent dans l'ASC.
+    # Ce taux utilise pupil_missing_acquisition, pas les blinks/padding.
+    max_run_acquisition_missing_fraction: float = 0.45
 
-    # Fenêtre invalide si plus de 25% d'échantillons manquants.
-    max_moment_missing_fraction: float = 0.25
+    # Une fenêtre est exclue si >50% du signal est vraiment absent.
+    max_moment_missing_fraction: float = 0.40
 
-    # Baseline invalide si plus de 25% d'échantillons manquants.
-    max_baseline_missing_fraction: float = 0.25
+    # Baseline invalide si >50% manquant.
+    max_baseline_missing_fraction: float = 0.40
 
-    # Exclusion du run si trop peu d'essais dynamiques valides.
-    min_valid_trial_fraction_per_run: float = 0.50
+    # Conservé pour compatibilité, mais le run n'est plus exclu sur ce critère.
+    min_valid_trial_fraction_per_run: float = 0.0
 
-    # Valeur de X utilisée uniquement pour la QC run.
-    # Les analyses statistiques sont ensuite faites pour TOUS les X.
-    run_qc_x_s: float = 1.0
-
-    # Sujet exclu si moins de trois runs valides.
-    min_valid_runs_per_subject: int = 3
+    # Sujet exclu seulement s'il a moins de deux runs réellement exploitables.
+    min_valid_runs_per_subject: int = 2
 
     # --------------------------------------------------------------
-    # Fenêtres temporelles
+    # Fenêtres temporelles : analyses principales
     # --------------------------------------------------------------
-    induction_duration_s: float = 10.0
 
-    # Exploration systématique :
-    # 0.5, 0.6, 0.7, ..., 2.0 secondes.
-    dynamic_x_values_s: tuple[float, ...] = tuple(
-        round(0.5 + 0.1 * index, 1)
-        for index in range(16)
-    )
+    # Induction précoce : réflexe photomoteur/luminance.
+    # Cette fenêtre est séparée et n'est pas interprétée comme arousal.
+    induction_early_start_s: float = 0.0
+    induction_early_end_s: float = 2.0
 
-    # Une fenêtre tronquée plus courte que 0.5 s est rejetée.
+    # H1 principal : réponse émotionnelle soutenue.
+    induction_late_start_s: float = 2.0
+    induction_late_end_s: float = 10.0
+
+    # H2 principal : fenêtre juste avant le clic "idée trouvée".
+    fixed_pre_idea_window_s: float = 1.0
+
+    # H3 principal : première appréciation, avant le premier mouvement.
+    liking_use_first_movement: bool = True
+
+    # Une fenêtre tronquée est conservée si elle contient au moins 500 ms.
     minimum_usable_window_s: float = 0.5
 
     # Baseline : dernières 500 ms de la croix de fixation précédente.
     baseline_duration_s: float = 0.5
+
+    # --------------------------------------------------------------
+    # Analyses de sensibilité / robustesse
+    #
+    # Ces paramètres ne doivent pas être décrits comme confirmatoires
+    # puisque les résultats principaux ont déjà été observés.
+    # --------------------------------------------------------------
+
+    # H1 : sensibilité au début de la fenêtre émotionnelle tardive.
+    # La fin reste fixée à 10 s, durée de l'induction image+son.
+    induction_late_start_values_s: tuple[float, ...] = (
+        1.5,
+        2.0,
+        2.5,
+        3.0,
+    )
+
+    # H2 : sensibilité à la durée précédant le clic idée.
+    pre_idea_window_values_s: tuple[float, ...] = (
+        0.5,
+        0.75,
+        1.0,
+        1.25,
+        1.5,
+        1.75,
+        2.0,
+    )
+
+    # H3 : deux définitions conceptuellement distinctes.
+    # first_movement = évaluation initiale avant mouvement curseur.
+    # validation = évaluation complète jusqu'à validation finale.
+    liking_endpoints: tuple[str, ...] = (
+        "first_movement",
+        "validation",
+    )
+
+    # Baseline : sensibilité optionnelle, non activée par défaut.
+    # Garder une seule valeur pour l'analyse principale.
+    baseline_duration_values_s: tuple[float, ...] = (
+        0.5,
+    )
+
+    # --------------------------------------------------------------
+    # Evènements oculomoteurs
+    # --------------------------------------------------------------
+
+    # Valeur principale utilisée pour séparer microsaccades / saccades.
+    microsaccade_max_amplitude_deg: float = 1.0
+
+    # Sensibilité du seuil microsaccade.
+    microsaccade_threshold_values_deg: tuple[float, ...] = (
+        0.5,
+        0.75,
+        1.0,
+        1.25,
+        1.5,
+    )
+
+    # --------------------------------------------------------------
+    # ROI gaze aversion
+    # --------------------------------------------------------------
+    # À renseigner si les coordonnées réelles du mot-indice sont connues.
+    # Si None, la métrique gaze_aversion_fraction devient NaN.
+    cue_roi_center_x: float | None = None
+    cue_roi_center_y: float | None = None
+
+    cue_roi_half_width_px: float = 200.0
+    cue_roi_half_height_px: float = 100.0
+
+    # Limite mémoire pour les données utilisées dans les heatmaps gaze.
+    gaze_plot_max_samples_per_trial: int = 2000
 
     # --------------------------------------------------------------
     # Statistiques
@@ -92,34 +167,26 @@ class Config:
     min_subjects_for_model: int = 5
     min_levels_for_model: int = 2
 
-    # Important : la FDR inclut toutes les valeurs X explorées.
-    # Cela évite de sélectionner a posteriori le X avec la plus petite p-value.
-    fdr_across_all_x_values: bool = True
-
     # --------------------------------------------------------------
     # Figures
     # --------------------------------------------------------------
     dpi: int = 180
-
-    # Produit aussi les figures descriptives si modèle non estimable.
-    plot_non_estimable_hypotheses: bool = True
 
 
 DEFAULT_CONFIG = Config()
 
 
 def make_output_dirs(output_root: Path) -> dict[str, Path]:
-    """Crée l'arborescence complète de sortie."""
+    """Crée l'arborescence de sortie."""
     paths = {
         "root": output_root,
         "tables": output_root / "tables",
         "logs": output_root / "logs",
         "figures": output_root / "figures",
         "figures_exclusion": output_root / "figures" / "exclusion",
-        "figures_heatmaps": output_root / "figures" / "heatmaps",
-        "figures_hypotheses": output_root / "figures" / "hypotheses",
-        "figures_results_tables": output_root / "figures" / "results_tables",
-        "figures_x_stability": output_root / "figures" / "x_stability",
+        "figures_results": output_root / "figures" / "results",
+        "figures_gaze": output_root / "figures" / "gaze_heatmaps",
+        "figures_distributions": output_root / "figures" / "distributions",
     }
 
     for path in paths.values():

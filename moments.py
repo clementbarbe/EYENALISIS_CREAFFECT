@@ -1,4 +1,4 @@
-"""Construction des fenêtres temporelles expérimentales."""
+"""Construction des fenêtres temporelles confirmatoires FGAT."""
 
 from __future__ import annotations
 
@@ -12,29 +12,23 @@ from sync import SyncResult, behavioral_to_eyelink_ms
 def _create_window(
     moment: str,
     start_s: float,
-    available_end_s: float,
-    requested_duration_s: float,
-    window_x_s: float,
+    end_s: float,
+    requested_duration_s: float | None,
     cfg: Config,
 ) -> dict:
-    """Construit une fenêtre, tronquée si la phase est trop courte."""
-    end_s = min(
-        available_end_s,
-        start_s + requested_duration_s,
-    )
-
+    """Construit une fenêtre avec métadonnées de durée."""
     actual_duration_s = max(0.0, end_s - start_s)
 
     return {
         "moment": moment,
-        "window_x_s": window_x_s,
+        "window_x_s": (
+            requested_duration_s
+            if requested_duration_s is not None
+            else 0.0
+        ),
         "start_behavior_s": start_s,
         "end_behavior_s": end_s,
         "requested_duration_s": requested_duration_s,
-        "available_duration_s": max(
-            0.0,
-            available_end_s - start_s,
-        ),
         "actual_duration_s": actual_duration_s,
         "duration_valid": (
             actual_duration_s >= cfg.minimum_usable_window_s
@@ -42,17 +36,13 @@ def _create_window(
     }
 
 
-def _get_baseline_bounds(
+def _get_cross_baseline(
     trial: pd.Series,
     onset_column: str,
     duration_column: str,
     cfg: Config,
 ) -> tuple[float, float, str]:
-    """
-    Retourne les bornes de baseline depuis la croix précédente.
-
-    Baseline = dernières 500 ms de la croix de fixation.
-    """
+    """Retourne les dernières ms de la croix précédente."""
     cross_onset = trial.get(onset_column, np.nan)
     cross_duration = trial.get(duration_column, np.nan)
 
@@ -60,9 +50,7 @@ def _get_baseline_bounds(
         return np.nan, np.nan, "missing_cross_timestamp"
 
     cross_onset = float(cross_onset)
-    cross_duration = float(cross_duration)
-
-    cross_end = cross_onset + cross_duration
+    cross_end = cross_onset + float(cross_duration)
 
     baseline_start = max(
         cross_onset,
@@ -82,31 +70,7 @@ def _append_window(
     timing: pd.Series,
     sync: SyncResult,
 ) -> None:
-    """Convertit les bornes comportementales en timestamps EyeLink."""
-    start_ms = behavioral_to_eyelink_ms(
-        window["start_behavior_s"],
-        timing,
-        sync,
-    )
-
-    end_ms = behavioral_to_eyelink_ms(
-        window["end_behavior_s"],
-        timing,
-        sync,
-    )
-
-    baseline_start_ms = behavioral_to_eyelink_ms(
-        baseline_start_s,
-        timing,
-        sync,
-    )
-
-    baseline_end_ms = behavioral_to_eyelink_ms(
-        baseline_end_s,
-        timing,
-        sync,
-    )
-
+    """Ajoute une fenêtre et ses timestamps EyeLink."""
     rows.append(
         {
             **trial.to_dict(),
@@ -114,10 +78,26 @@ def _append_window(
             "baseline_source": baseline_source,
             "baseline_start_behavior_s": baseline_start_s,
             "baseline_end_behavior_s": baseline_end_s,
-            "start_eyelink_ms": start_ms,
-            "end_eyelink_ms": end_ms,
-            "baseline_start_eyelink_ms": baseline_start_ms,
-            "baseline_end_eyelink_ms": baseline_end_ms,
+            "start_eyelink_ms": behavioral_to_eyelink_ms(
+                window["start_behavior_s"],
+                timing,
+                sync,
+            ),
+            "end_eyelink_ms": behavioral_to_eyelink_ms(
+                window["end_behavior_s"],
+                timing,
+                sync,
+            ),
+            "baseline_start_eyelink_ms": behavioral_to_eyelink_ms(
+                baseline_start_s,
+                timing,
+                sync,
+            ),
+            "baseline_end_eyelink_ms": behavioral_to_eyelink_ms(
+                baseline_end_s,
+                timing,
+                sync,
+            ),
         }
     )
 
@@ -129,30 +109,21 @@ def build_moment_windows(
     cfg: Config,
 ) -> pd.DataFrame:
     """
-    Crée M1, M2a, M2b, M3a et M3b.
+    Construit uniquement les fenêtres confirmatoires fixes.
 
-    M1 :
-        Une seule fenêtre de 10 secondes par induction.
-
-    M2/M3 :
-        Une fenêtre par valeur de X entre 0.5 et 2.0 secondes.
-
-    Baselines :
-        M1    -> croix avant induction.
-        M2a/b -> croix avant cue FGAT.
-        M3a/b -> croix avant LTask.
-
-    Notes
-    -----
-    window_x_s = 0.0 pour M1 car M1 est fixe et ne dépend pas de X.
+    Fenêtres :
+    - M1_early_photometric : induction 0–2 s.
+    - H1_induction_late : induction 2–10 s.
+    - H2_pre_idea : X secondes avant fgat_input_time.
+    - H3_liking : LTask_onset -> LTask_first_movement.
+    - H4_full_search_gaze : fgat_cue_onset -> fgat_input_time.
     """
     rows: list[dict] = []
 
     for _, trial in trials.iterrows():
 
         # ----------------------------------------------------------
-        # Moment 1 : induction émotionnelle.
-        # Une seule fois par bloc.
+        # H1 : induction émotionnelle.
         # ----------------------------------------------------------
         if (
             bool(trial["has_induction"])
@@ -160,168 +131,152 @@ def build_moment_windows(
         ):
             induction_onset = float(trial["emo_stim_onset"])
 
-            baseline_start_s, baseline_end_s, baseline_source = (
-                _get_baseline_bounds(
-                    trial,
-                    "t_onset_cross_induc",
-                    "t_duration_cross_induc",
-                    cfg,
-                )
+            baseline = _get_cross_baseline(
+                trial,
+                "t_onset_cross_induc",
+                "t_duration_cross_induc",
+                cfg,
             )
 
-            window = _create_window(
-                moment="M1_induction",
-                start_s=induction_onset,
-                available_end_s=(
-                    induction_onset + cfg.induction_duration_s
+            early_window = _create_window(
+                moment="M1_early_photometric",
+                start_s=induction_onset + cfg.induction_early_start_s,
+                end_s=induction_onset + cfg.induction_early_end_s,
+                requested_duration_s=(
+                    cfg.induction_early_end_s
+                    - cfg.induction_early_start_s
                 ),
-                requested_duration_s=cfg.induction_duration_s,
-                window_x_s=0.0,
+                cfg=cfg,
+            )
+
+            late_window = _create_window(
+                moment="H1_induction_late",
+                start_s=induction_onset + cfg.induction_late_start_s,
+                end_s=induction_onset + cfg.induction_late_end_s,
+                requested_duration_s=(
+                    cfg.induction_late_end_s
+                    - cfg.induction_late_start_s
+                ),
                 cfg=cfg,
             )
 
             _append_window(
                 rows,
                 trial,
-                window,
-                baseline_start_s,
-                baseline_end_s,
-                baseline_source,
+                early_window,
+                *baseline,
+                timing,
+                sync,
+            )
+
+            _append_window(
+                rows,
+                trial,
+                late_window,
+                *baseline,
                 timing,
                 sync,
             )
 
         # ----------------------------------------------------------
-        # Moments 2a et 2b : recherche créative.
+        # H2 et H4 : recherche d'idée.
         # ----------------------------------------------------------
         cue = trial.get("fgat_cue_onset", np.nan)
-        response = trial.get("fgat_input_time", np.nan)
+        idea_time = trial.get("fgat_input_time", np.nan)
 
-        if pd.notna(cue) and pd.notna(response):
+        if pd.notna(cue) and pd.notna(idea_time):
             cue = float(cue)
-            response = float(response)
+            idea_time = float(idea_time)
 
-            baseline_start_s, baseline_end_s, baseline_source = (
-                _get_baseline_bounds(
-                    trial,
-                    "t_onset_cross_cue_fgat",
-                    "t_duration_cross_cue_fgat",
-                    cfg,
-                )
+            baseline = _get_cross_baseline(
+                trial,
+                "t_onset_cross_cue_fgat",
+                "t_duration_cross_cue_fgat",
+                cfg,
             )
 
-            for x_s in cfg.dynamic_x_values_s:
+            # H2 : période fixe juste avant le clic "idée trouvée".
+            h2_start = max(
+                cue,
+                idea_time - cfg.fixed_pre_idea_window_s,
+            )
 
-                # M2a : début de recherche.
-                window_start = _create_window(
-                    moment="M2a_search_start",
-                    start_s=cue,
-                    available_end_s=response,
-                    requested_duration_s=x_s,
-                    window_x_s=x_s,
-                    cfg=cfg,
-                )
+            pre_idea_window = _create_window(
+                moment="H2_pre_idea",
+                start_s=h2_start,
+                end_s=idea_time,
+                requested_duration_s=cfg.fixed_pre_idea_window_s,
+                cfg=cfg,
+            )
 
-                _append_window(
-                    rows,
-                    trial,
-                    window_start,
-                    baseline_start_s,
-                    baseline_end_s,
-                    baseline_source,
-                    timing,
-                    sync,
-                )
+            # H4 : période entière cue -> clic idée, pour les heatmaps gaze.
+            full_search_window = _create_window(
+                moment="H4_full_search_gaze",
+                start_s=cue,
+                end_s=idea_time,
+                requested_duration_s=None,
+                cfg=cfg,
+            )
 
-                # M2b : fin de recherche.
-                end_window_start = max(cue, response - x_s)
+            _append_window(
+                rows,
+                trial,
+                pre_idea_window,
+                *baseline,
+                timing,
+                sync,
+            )
 
-                window_end = _create_window(
-                    moment="M2b_search_end",
-                    start_s=end_window_start,
-                    available_end_s=response,
-                    requested_duration_s=x_s,
-                    window_x_s=x_s,
-                    cfg=cfg,
-                )
-
-                _append_window(
-                    rows,
-                    trial,
-                    window_end,
-                    baseline_start_s,
-                    baseline_end_s,
-                    baseline_source,
-                    timing,
-                    sync,
-                )
+            _append_window(
+                rows,
+                trial,
+                full_search_window,
+                *baseline,
+                timing,
+                sync,
+            )
 
         # ----------------------------------------------------------
-        # Moments 3a et 3b : évaluation.
+        # H3 : liking de l'idée.
         # ----------------------------------------------------------
         ltask_onset = trial.get("LTask_onset", np.nan)
+        first_movement = trial.get("LTask_first_movement", np.nan)
         validation = trial.get("LTask_validation", np.nan)
 
-        if pd.notna(ltask_onset) and pd.notna(validation):
-            ltask_onset = float(ltask_onset)
-            validation = float(validation)
+        liking_end = np.nan
 
-            baseline_start_s, baseline_end_s, baseline_source = (
-                _get_baseline_bounds(
-                    trial,
-                    "t_onset_cross_LTask",
-                    "t_duration_cross_LTask",
-                    cfg,
-                )
+        if cfg.liking_use_first_movement and pd.notna(first_movement):
+            liking_end = first_movement
+
+        elif pd.notna(validation):
+            liking_end = validation
+
+        if pd.notna(ltask_onset) and pd.notna(liking_end):
+            ltask_onset = float(ltask_onset)
+            liking_end = float(liking_end)
+
+            baseline = _get_cross_baseline(
+                trial,
+                "t_onset_cross_LTask",
+                "t_duration_cross_LTask",
+                cfg,
             )
 
-            for x_s in cfg.dynamic_x_values_s:
+            liking_window = _create_window(
+                moment="H3_liking",
+                start_s=ltask_onset,
+                end_s=liking_end,
+                requested_duration_s=None,
+                cfg=cfg,
+            )
 
-                # M3a : début de l'évaluation.
-                window_start = _create_window(
-                    moment="M3a_rating_start",
-                    start_s=ltask_onset,
-                    available_end_s=validation,
-                    requested_duration_s=x_s,
-                    window_x_s=x_s,
-                    cfg=cfg,
-                )
-
-                _append_window(
-                    rows,
-                    trial,
-                    window_start,
-                    baseline_start_s,
-                    baseline_end_s,
-                    baseline_source,
-                    timing,
-                    sync,
-                )
-
-                # M3b : fin de l'évaluation.
-                end_window_start = max(
-                    ltask_onset,
-                    validation - x_s,
-                )
-
-                window_end = _create_window(
-                    moment="M3b_rating_end",
-                    start_s=end_window_start,
-                    available_end_s=validation,
-                    requested_duration_s=x_s,
-                    window_x_s=x_s,
-                    cfg=cfg,
-                )
-
-                _append_window(
-                    rows,
-                    trial,
-                    window_end,
-                    baseline_start_s,
-                    baseline_end_s,
-                    baseline_source,
-                    timing,
-                    sync,
-                )
+            _append_window(
+                rows,
+                trial,
+                liking_window,
+                *baseline,
+                timing,
+                sync,
+            )
 
     return pd.DataFrame(rows)

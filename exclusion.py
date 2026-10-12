@@ -1,4 +1,4 @@
-"""Règles et résumés d'exclusion."""
+"""Règles et résumés d'exclusion permissifs."""
 
 from __future__ import annotations
 
@@ -14,7 +14,15 @@ def evaluate_run_exclusion(
     sync: SyncResult,
     cfg: Config,
 ) -> dict:
-    """Détermine si un run est valide."""
+    """
+    Exclut uniquement les runs réellement inutilisables.
+
+    Le taux utilisé est le taux de données réellement absentes dans le fichier
+    ASC : pupil_missing_acquisition.
+
+    Les blinks, padding et outliers du pipeline ne doivent pas à eux seuls
+    exclure un run entier.
+    """
     reasons: list[str] = []
 
     if not sync.success:
@@ -32,30 +40,41 @@ def evaluate_run_exclusion(
         return {
             "run_valid": False,
             "run_missing_fraction": np.nan,
+            "run_acquisition_missing_fraction": np.nan,
             "run_unique_pupil_values": 0,
             "run_exclusion_reason": ";".join(reasons),
         }
 
-    missing_fraction = float(
-        preprocessed["pupil_missing_raw"].mean()
+    missing_column = (
+        "pupil_missing_acquisition"
+        if "pupil_missing_acquisition" in preprocessed.columns
+        else "pupil_missing_raw"
     )
 
-    valid_pupil = preprocessed["pupil_clean"].dropna()
-    unique_pupil_values = int(valid_pupil.nunique())
+    acquisition_missing_fraction = float(
+        preprocessed[missing_column].mean()
+    )
 
-    if missing_fraction > cfg.max_run_missing_fraction:
-        reasons.append("run_missing_fraction_above_threshold")
+    clean_signal = preprocessed["pupil_clean"].dropna()
+    unique_values = int(clean_signal.nunique())
 
     if (
-        valid_pupil.empty
-        or unique_pupil_values < cfg.min_unique_pupil_values
+        acquisition_missing_fraction
+        > cfg.max_run_acquisition_missing_fraction
     ):
+        reasons.append("run_acquisition_missing_above_threshold")
+
+    if clean_signal.empty:
+        reasons.append("no_usable_pupil_signal")
+
+    elif unique_values < cfg.min_unique_pupil_values:
         reasons.append("implausible_or_constant_pupil")
 
     return {
         "run_valid": len(reasons) == 0,
-        "run_missing_fraction": missing_fraction,
-        "run_unique_pupil_values": unique_pupil_values,
+        "run_missing_fraction": acquisition_missing_fraction,
+        "run_acquisition_missing_fraction": acquisition_missing_fraction,
+        "run_unique_pupil_values": unique_values,
         "run_exclusion_reason": ";".join(reasons),
     }
 
@@ -64,7 +83,7 @@ def evaluate_subject_exclusion(
     run_qc: pd.DataFrame,
     cfg: Config,
 ) -> pd.DataFrame:
-    """Exclut les sujets avec moins de N runs valides."""
+    """Exclut les sujets ayant moins de N runs valides."""
     subject_qc = (
         run_qc.groupby("subject_id", as_index=False)["run_valid"]
         .sum()
@@ -128,12 +147,6 @@ def summarize_subject_exclusions(
     if excluded.empty:
         return pd.DataFrame(columns=["reason", "n_subjects"])
 
-    excluded["subject_exclusion_reason"] = (
-        excluded["subject_exclusion_reason"]
-        .fillna("unknown")
-        .replace("", "unknown")
-    )
-
     return (
         excluded.groupby(
             "subject_exclusion_reason",
@@ -153,7 +166,7 @@ def summarize_subject_exclusions(
 def summarize_moment_exclusions(
     metrics_long: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Compte les exclusions au niveau essai x moment."""
+    """Compte les exclusions au niveau essai × moment."""
     keys = [
         "subject_id",
         "run_id",
@@ -163,7 +176,9 @@ def summarize_moment_exclusions(
         "moment_exclusion_reason",
     ]
 
-    windows = metrics_long[keys].drop_duplicates()
+    available = [column for column in keys if column in metrics_long.columns]
+
+    windows = metrics_long[available].drop_duplicates()
 
     excluded = windows.loc[
         ~windows["moment_valid"].fillna(False)
