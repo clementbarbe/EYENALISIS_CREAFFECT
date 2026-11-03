@@ -1,6 +1,21 @@
-# CREAFFECT · Eye-tracking simultané à l'IRMf — Pipeline exploratoire V2
+# CREAFFECT · Eye-tracking IRMf et mode projet configurable
 
 **Statut :** pipeline exploratoire, auditable et reproductible. Il ne s'agit **pas** d'un protocole universellement validé ni d'une analyse confirmatoire pré-enregistrée. Les seuils QC proposés sont des points de départ à examiner **sans regarder les effets des conditions**.
+
+Le [mode projet version 1](docs/MODE_PROJET.md) permet maintenant de déclarer les acquisitions, événements, fenêtres, baselines, métriques et contrastes dans un fichier JSON ou YAML, sans conventions C4X/FGAT. Le [projet d'exemple exécutable](examples/project_example.json) et son [générateur de données synthétiques](examples/generate_demo.py) permettent de l'essayer :
+
+```bash
+python examples/generate_demo.py /tmp/eyetrack_demo
+python run_pipeline.py --project /tmp/eyetrack_demo/project.json \
+  --output-dir /tmp/eyetrack_demo_results --qc-plots
+python run_pipeline.py --list-metrics
+```
+
+Installer d'abord les dépendances ci-dessous. Les dossiers de démonstration et de résultats doivent être nouveaux ou vides.
+
+L'[audit du 3 novembre 2026](docs/AUDIT_SCIENTIFIQUE_ET_PORTABILITE_2026-11-03.md) décrit l'état initial et la littérature. Plusieurs corrections partagées ont ensuite été implémentées ; elles changent certains calculs et sont détaillées dans le [guide du mode projet](docs/MODE_PROJET.md) et le [changelog](CHANGELOG_PROJECT_V1.md). La cohorte doit être réanalysée dans un nouveau dossier après inspection du QC. Les résultats historiques présents dans `output/` n'ont pas été écrasés. Le grand fichier [project_spec.proposed.yaml](examples/project_spec.proposed.yaml) reste une proposition plus large, distincte du contrat version 1 réellement exécutable.
+
+Les sections suivantes décrivent le profil CREAFFECT historique ; les corrections communes et le nouveau contrat de configuration sont précisés dans le guide lié ci-dessus.
 
 ## 1. Prérequis et usage
 

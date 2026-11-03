@@ -35,6 +35,7 @@ class Config:
 
     pupil_speed_mad_threshold: float = 6.0
     pupil_outlier_mad_threshold: float = 6.0
+    pupil_reject_speed_outliers: bool = True
 
     interpolation_max_gap_ms: int = 200
 
@@ -45,14 +46,14 @@ class Config:
     # --------------------------------------------------------------
     # Exclusions volontairement permissives
     # --------------------------------------------------------------
-    # Exclusion run seulement si >60% réellement absent dans l'ASC.
+    # Exclusion run au-delà du seuil de données absentes dans l'ASC.
     # Ce taux utilise pupil_missing_acquisition, pas les blinks/padding.
     max_run_acquisition_missing_fraction: float = 0.45
 
-    # Une fenêtre est exclue si >50% du signal est vraiment absent.
+    # Ancien paramètre conservé ; le QC utilise min_observed_fraction_window.
     max_moment_missing_fraction: float = 0.30
 
-    # Baseline invalide si >50% manquant.
+    # Fraction maximale de données d'acquisition manquantes dans la baseline.
     max_baseline_missing_fraction: float = 0.25
 
     # Conservé pour compatibilité, mais le run n'est plus exclu sur ce critère.
@@ -98,6 +99,7 @@ class Config:
 
     # Baseline soustractive : dernières 500 ms de la croix de fixation précédente.
     baseline_duration_s: float = 0.5
+    minimum_baseline_duration_s: float = 0.5
 
     # --------------------------------------------------------------
     # Analyses de sensibilité / robustesse

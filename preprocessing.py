@@ -56,15 +56,20 @@ def _mask_speed_near_missing_segments(speed_mask: np.ndarray, missing_mask: np.n
 
 
 def _interpolate_short_gaps(signal: pd.Series, timestamps_ms: np.ndarray,
-                            max_gap_ms: float) -> tuple[pd.Series, np.ndarray]:
+                            max_gap_ms: float, segment_ids=None) -> tuple[pd.Series, np.ndarray]:
     result = signal.to_numpy(dtype=float, copy=True)
     interpolated_mask = np.zeros(len(result), dtype=bool)
+    dt = float(np.median(np.diff(timestamps_ms))) if len(result) > 1 else 1.0
     starts, ends = _contiguous_intervals(~np.isfinite(result))
     for a, b in zip(starts, ends):
         if a == 0 or b == len(result):
             continue
-        # Temps couvert par la lacune, non le nombre de samples.
-        if timestamps_ms[b] - timestamps_ms[a-1] > max_gap_ms + 2:
+        # Trou après padding ; aucune reconstruction d'une interruption.
+        if timestamps_ms[b] - timestamps_ms[a-1] - dt > max_gap_ms + 1e-9:
+            continue
+        if np.any(np.diff(timestamps_ms[a-1:b+1]) > 1.5 * dt):
+            continue
+        if segment_ids is not None and np.any(np.diff(segment_ids[a-1:b+1]) != 0):
             continue
         if not np.isfinite(result[a-1]) or not np.isfinite(result[b]):
             continue
@@ -75,7 +80,8 @@ def _interpolate_short_gaps(signal: pd.Series, timestamps_ms: np.ndarray,
     return pd.Series(result, index=signal.index), interpolated_mask
 
 
-def _filter_valid_segments(signal: pd.Series, t_ms: np.ndarray, cfg: Config) -> pd.Series:
+def _filter_valid_segments(signal: pd.Series, t_ms: np.ndarray, cfg: Config,
+                           segment_ids=None) -> pd.Series:
     if not cfg.lowpass_enabled:
         return signal
     a = signal.to_numpy(dtype=float, copy=True)
@@ -87,6 +93,8 @@ def _filter_valid_segments(signal: pd.Series, t_ms: np.ndarray, cfg: Config) -> 
     valid = np.isfinite(a)
     # Séparer aussi les interruptions d'horloge : ne pas lisser au travers.
     gaps = np.flatnonzero(np.diff(t_ms) > 1.5 * (1000.0 / fs)) + 1
+    if segment_ids is not None:
+        gaps = np.union1d(gaps, np.flatnonzero(np.diff(segment_ids) != 0) + 1)
     starts, ends = _contiguous_intervals(valid)
     for start, end in zip(starts, ends):
         edges = np.r_[start, gaps[(gaps > start) & (gaps < end)], end]
@@ -107,31 +115,46 @@ def _eyelink_blink_intervals(events: pd.DataFrame) -> pd.DataFrame:
     if e.empty:
         return pd.DataFrame(columns=columns)
     e = e.dropna(subset=['start_ms', 'end_ms'])
-    e = e.loc[(e['end_ms'] > e['start_ms']) & (e['end_ms']-e['start_ms'] < 2000)]
+    e = e.loc[e['end_ms'] > e['start_ms']]
     result = e[['start_ms','end_ms','duration_ms']].copy()
     result.columns = columns
-    result['blink_duration_ms'] = (result['blink_end_ms']-result['blink_start_ms']).astype(float)
+    duration = pd.to_numeric(result['blink_duration_ms'], errors='coerce')
+    result['blink_duration_ms'] = duration.where(np.isfinite(duration) & duration.gt(0),
+                                               result['blink_end_ms'] - result['blink_start_ms'])
     return result.reset_index(drop=True)
 
 
 def preprocess_pupil(samples: pd.DataFrame, events: pd.DataFrame,
                      cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
-    df = samples.sort_values('timestamp_ms').drop_duplicates('timestamp_ms', keep='first').reset_index(drop=True).copy()
+    df = samples.reset_index(drop=True).copy()
     blink_intervals = _eyelink_blink_intervals(events)
     if df.empty:
         return df, blink_intervals
     t = df['timestamp_ms'].to_numpy(dtype=float)
+    if not np.isfinite(t).all() or not np.all(np.diff(t) > 0):
+        raise ValueError('Samples must have finite, strictly increasing timestamps')
+    segment_ids = df.get('segment_id', pd.Series(0, index=df.index)).to_numpy()
     pupil = pd.to_numeric(df['pupil_size'], errors='coerce').to_numpy(dtype=float)
     acquisition_missing = ~np.isfinite(pupil) | (pupil <= cfg.min_plausible_pupil)
     event_blinks = _mask_from_intervals(t, blink_intervals['blink_start_ms'].to_numpy(dtype=float),
                                         blink_intervals['blink_end_ms'].to_numpy(dtype=float))
     with np.errstate(divide='ignore', invalid='ignore'):
-        speed = np.abs(np.diff(pupil) / (np.diff(t) / 1000.0))
-    speed = np.r_[np.nan, speed]
-    speed_artifact = _robust_outlier_mask(pd.Series(speed), cfg.pupil_speed_mad_threshold)
+        pair_speed = np.abs(np.diff(pupil) / (np.diff(t) / 1000.0))
+    good_pairs = (~acquisition_missing[:-1] & ~acquisition_missing[1:]
+                  & (np.diff(t) <= 1.5 * 1000.0 / cfg.sampling_rate_hz)
+                  & (np.diff(segment_ids) == 0))
+    pair_speed[~good_pairs] = np.nan
+    speed = np.fmax(np.r_[np.nan, pair_speed], np.r_[pair_speed, np.nan])
+    finite_speed = speed[np.isfinite(speed)]
+    speed_artifact = np.zeros(len(t), dtype=bool)
+    if len(finite_speed) >= 10:
+        med = np.median(finite_speed)
+        mad = np.median(np.abs(finite_speed - med))
+        speed_artifact = speed > med + max(1e-9, cfg.pupil_speed_mad_threshold * 1.4826 * mad)
     near_missing = _mask_speed_near_missing_segments(speed_artifact, acquisition_missing, t)
     # MASQUE DE NETTOYAGE: ne pas l'assimiler aux clignements physiologiques.
-    artifact = _expand_contiguous_segments(acquisition_missing | event_blinks | near_missing,
+    rejected_speed = speed_artifact if cfg.pupil_reject_speed_outliers else near_missing
+    artifact = _expand_contiguous_segments(acquisition_missing | event_blinks | rejected_speed,
                                            t, cfg.blink_padding_before_ms, cfg.blink_padding_after_ms)
     clean_input = pupil.copy()
     clean_input[artifact] = np.nan
@@ -139,8 +162,8 @@ def preprocess_pupil(samples: pd.DataFrame, events: pd.DataFrame,
     clean_input[outliers] = np.nan
     artifact |= outliers
     interp, interpolated = _interpolate_short_gaps(pd.Series(clean_input), t,
-                                                   cfg.interpolation_max_gap_ms)
-    df['pupil_clean'] = _filter_valid_segments(interp, t, cfg)
+                                                   cfg.interpolation_max_gap_ms, segment_ids)
+    df['pupil_clean'] = _filter_valid_segments(interp, t, cfg, segment_ids)
     df['pupil_missing_acquisition'] = acquisition_missing
     df['pupil_artifact_mask'] = artifact
     df['pupil_observed_valid'] = ~artifact

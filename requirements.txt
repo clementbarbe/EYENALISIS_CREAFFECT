@@ -5,3 +5,4 @@ statsmodels>=0.14
 matplotlib>=3.7
 seaborn>=0.12
 pytest>=7.0
+PyYAML>=6.0

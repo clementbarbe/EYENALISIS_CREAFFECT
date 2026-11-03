@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "project_id": "demo_variable_events",
+  "description": "Exemple synthétique : aucun résultat scientifique à interpréter.",
+  "recordings_manifest": "recordings.tsv",
+  "parameters": {
+    "eye": "R",
+    "blink_padding_before_ms": 100,
+    "blink_padding_after_ms": 100,
+    "interpolation_max_gap_ms": 200,
+    "lowpass_cutoff_hz": 6.0,
+    "minimum_baseline_duration_s": 0.5
+  },
+  "events": {
+    "mapping": {
+      "fixation": "FIX",
+      "stimulus": "STIM",
+      "response": "RESP",
+      "rating": "RATE",
+      "first_movement": "MOVE"
+    }
+  },
+  "synchronization": {
+    "mode": "paired_anchors",
+    "max_residual_ms": 5.0,
+    "drift_warning_ppm": 150.0
+  },
+  "baselines": {
+    "fixation_before": {
+      "event": "fixation",
+      "occurrence": "last_before_anchor",
+      "duration_s": 0.5,
+      "end_edge": "offset",
+      "clipping_policy": "reject"
+    }
+  },
+  "rois": {
+    "central_target": {
+      "center_x": 960,
+      "center_y": 540,
+      "half_width_px": 150,
+      "half_height_px": 80
+    }
+  },
+  "windows": [
+    {
+      "id": "stimulus_late",
+      "anchor": {"event": "stimulus"},
+      "start": {"anchor_offset_s": 0.3},
+      "end": {"anchor_offset_s": 1.1},
+      "baseline": "fixation_before",
+      "min_duration_s": 0.8,
+      "role": "primary",
+      "metrics": ["pupil_baseline_corrected", "pupil_peak_delta", "pupil_peak_latency_s"]
+    },
+    {
+      "id": "pre_response",
+      "anchor": {"event": "response"},
+      "start": {"anchor_offset_s": -1.2},
+      "end": {"anchor_offset_s": -0.2},
+      "lower_bound": {"event": "stimulus"},
+      "clipping_policy": "truncate",
+      "min_duration_s": 0.5,
+      "baseline": "fixation_before",
+      "metrics": ["pupil_baseline_corrected", "pupil_slope_per_s"]
+    },
+    {
+      "id": "decision",
+      "anchor": {"event": "stimulus"},
+      "start": {"anchor_offset_s": 0.0},
+      "end": {"event": "response"},
+      "baseline": "fixation_before",
+      "roi": "central_target",
+      "metrics": [
+        "pupil_mean", "pupil_median", "pupil_auc", "pupil_integrated_duration_s",
+        "pupil_auc_per_observed_s", "blink_count", "blink_rate_per_s", "blink_mean_duration_ms",
+        "blink_closed_fraction", "all_saccade_rate_per_s", "fixation_count",
+        "fixation_mean_duration_ms", "gaze_roi_dwell_s", "gaze_aversion_fraction"
+      ]
+    },
+    {
+      "id": "rating_pre_movement",
+      "anchor": {"event": "rating"},
+      "start": {"anchor_offset_s": 0},
+      "end": {"min": [{"anchor_offset_s": 1.0}, {"event": "first_movement"}]},
+      "baseline": "fixation_before",
+      "min_duration_s": 0.5,
+      "metrics": ["pupil_baseline_corrected", "gaze_dispersion_x", "gaze_dispersion_y"]
+    },
+    {
+      "id": "sliding_stimulus",
+      "anchor": {"event": "stimulus"},
+      "sliding": {"range_s": [0.0, 1.5], "widths_s": [0.5, 1.0], "step_s": 0.25},
+      "baseline": "fixation_before",
+      "role": "sensitivity",
+      "metrics": ["pupil_baseline_corrected"]
+    }
+  ],
+  "timecourses": {
+    "windows": ["stimulus_late", "pre_response"],
+    "bin_width_s": 0.05
+  },
+  "hypotheses": [
+    {
+      "id": "H1_pupil_condition",
+      "description": "Contraste B moins A pendant la réponse tardive.",
+      "window": "stimulus_late",
+      "metric": "pupil_baseline_corrected",
+      "predictor": "condition",
+      "contrast": ["B", "A"],
+      "numeric_covariates": ["response_time_s"],
+      "family": "primary_pupil"
+    }
+  ]
+}

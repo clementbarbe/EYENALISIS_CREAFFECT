@@ -1,0 +1,219 @@
+# PROPOSITION D'INTERFACE, NON EXÉCUTABLE PAR run_pipeline.py V2.
+# Aucun --config/--project n'existe actuellement. Ce fichier décrit le contrat
+# recommandé dans docs/AUDIT_SCIENTIFIQUE_ET_PORTABILITE_2026-11-03.md.
+specification_status: design_only
+schema_version: proposed-1
+project_id: prochain_projet
+analysis_status: exploratory
+
+inputs:
+  # Une ligne par acquisition : participant_id, session_id, run_id,
+  # asc_path, events_path, metadata_path ; chemins relatifs au manifest.
+  recordings_manifest: recordings.tsv
+  task_events:
+    format: long_tsv
+    required_columns:
+      - event_id
+      - participant_id
+      - session_id
+      - run_id
+      - trial_id
+      - event_type
+      - onset
+      - duration
+    time_unit: seconds
+    clock: behavioral
+    # Autres colonnes possibles : block_id, condition, item_id, accuracy,
+    # response_time_s, luminance, timeout, resumed, source_row.
+    join_events_by: [participant_id, session_id, run_id, trial_id]
+    repeated_event_policy: error_require_occurrence_selector
+  event_mapping:
+    fixation: fixation
+    stimulus: stimulus
+    response: response
+    rating: rating
+    first_movement: first_movement
+
+acquisition:
+  manufacturer: SR Research
+  model: EyeLink 1000 Plus
+  mount: long_range
+  eyes: [R]
+  eye_policy: explicit_per_recording
+  sampling_hz: from_header_validate_timestamps
+  coordinates: from_header_require_gaze
+  pupil_measure: from_header_require_area_or_diameter
+  pupil_unit: arbitrary_unit
+  tracker_filter: from_header
+  screen_geometry: from_recording_metadata
+  # Pour les degrés : écran visible et distance optique œil-écran via miroir.
+  # Ne pas utiliser la distance œil-caméra pour les angles visuels.
+  missing_geometry_policy: disable_degree_metrics_with_reason
+
+synchronization:
+  # Profil IRM ; pour un projet hors IRM, choisir des marqueurs d'horloges
+  # correspondants, ou identity seulement si l'horloge commune est garantie.
+  mode: paired_clock_anchors
+  eyelink_anchor_source: scanner_ttl
+  reference_anchor_source: scanner_trigger_log
+  model: affine_if_identifiable
+  allow_offset_only: true
+  offset_only_quality_label: drift_unverified
+  missing_anchor_policy: exclude_recording_with_reason
+  export_residuals: true
+  export_discarded_volumes: true
+
+preprocessing:
+  # Valeurs candidates : ni norme constructeur ni seuils universellement validés.
+  pupil:
+    invalid_values: [nonfinite, nonpositive, tracker_invalid]
+    speed_outliers:
+      method: two_sided_neighbor_speed_median_mad
+      scope: continuous_recording_segment
+      threshold_multiplier: 6.0
+      mad_scale: 1.4826
+    reject_isolated_valid_islands: true
+    blink_padding_ms: {before: 100, after: 100}
+    interpolation:
+      method: linear
+      max_padded_gap_ms: 200
+      cross_acquisition_breaks: false
+    filter:
+      enabled: true
+      family: butterworth_sos
+      cutoff_hz: 6.0
+      order: 4
+      phase: zero
+      independent_contiguous_segments: true
+  gaze:
+    keep_native_rate: true
+    apply_pupil_filter: false
+    interpolate_for_event_detection: false
+  masks_to_export:
+    - acquisition_missing
+    - tracker_blink
+    - pupil_artifact
+    - pupil_observed
+    - pupil_interpolated
+    - gaze_valid
+
+quality_profiles:
+  # À fixer après QC aveugle aux effets, séparément pour chaque famille.
+  pupil_phasic:
+    min_observed_fraction: 0.70
+    max_interpolated_fraction: 0.20
+    min_sampling_coverage: 0.95
+    max_unusable_gap_ms: 500
+  baseline:
+    min_observed_fraction: 0.75
+    min_sampling_coverage: 0.95
+    min_duration_s: 0.50
+  gaze:
+    min_valid_fraction: 0.70
+    min_sampling_coverage: 0.95
+  ocular_events:
+    require_exported_event_stream: true
+    require_detector_metadata: true
+    require_tracking_exposure_estimate: true
+    # Les clignements physiologiques ne doivent pas être assimilés à une
+    # simple perte technique dans l'estimation de l'exposition des blinks.
+
+baselines:
+  preceding_fixation:
+    event: fixation
+    relation: last_before_anchor_within_trial
+    start: {relative_to: offset, offset_s: -0.5}
+    end: {relative_to: offset, offset_s: 0.0}
+    statistic: median_observed
+    correction: subtractive
+    clipping_policy: reject
+    missing_policy: invalidate_baseline_dependent_metrics
+    quality_profile: baseline
+
+windows:
+  - id: stimulus_late
+    anchor: {event: stimulus, edge: onset}
+    start: {anchor_offset_s: 0.5}
+    end: {anchor_offset_s: 2.0}
+    baseline: preceding_fixation
+    min_duration_s: 1.5
+    clipping_policy: reject
+    metrics: [pupil_mean, pupil_baseline_corrected, pupil_auc]
+
+  - id: response_pre_motor
+    anchor: {event: response, edge: onset}
+    start: {anchor_offset_s: -1.2}
+    end: {anchor_offset_s: -0.2}
+    lower_bound: {event: stimulus, edge: onset, offset_s: 0.0}
+    clipping_policy: truncate_and_record
+    min_duration_s: 0.5
+    baseline: preceding_fixation
+    metrics: [pupil_baseline_corrected, pupil_slope_per_s]
+
+  - id: variable_decision
+    anchor: {event: stimulus, edge: onset}
+    start: {event: stimulus, edge: onset, offset_s: 0.0}
+    end: {event: response, edge: onset, offset_s: 0.0}
+    min_duration_s: 0.5
+    missing_endpoint_policy: exclude_window_with_reason
+    baseline: preceding_fixation
+    metrics: [pupil_baseline_corrected, pupil_auc, all_saccade_rate_per_s]
+    # Export obligatoire des durées planifiée, réelle, acquise et intégrée.
+
+  - id: rating_before_movement
+    anchor: {event: rating, edge: onset}
+    start: {anchor_offset_s: 0.0}
+    end: {event: first_movement, edge: onset, offset_s: 0.0}
+    min_duration_s: 0.5
+    missing_endpoint_policy: exclude_window_with_reason
+    # Aucun remplacement implicite par la validation finale.
+    baseline: preceding_fixation
+    metrics: [pupil_baseline_corrected, gaze_dispersion_x, gaze_dispersion_y]
+
+  - id: sliding_stimulus_exploration
+    anchor: {event: stimulus, edge: onset}
+    sliding: {range_s: [0.0, 4.0], widths_s: [0.5, 1.0, 2.0], step_s: 0.1}
+    metrics: [pupil_baseline_corrected]
+    baseline: preceding_fixation
+    analysis_role: sensitivity
+    inferential_policy: no_unadjusted_pointwise_tests
+
+timecourses:
+  windows: [stimulus_late, response_pre_motor]
+  bin_width_s: 0.05
+  include_all_expected_bins: true
+  quality_denominator: expected_samples_in_bin
+  apply_same_window_and_baseline_qc_as_metrics: true
+
+event_metrics:
+  count_assignment: onset_in_half_open_window
+  duration_assignment: clipped_overlap
+  rate_denominator: declared_valid_exposure_s
+  absent_event_stream_policy: missing_not_zero
+  no_blink_mean_duration: null
+  microsaccades: disabled_until_detector_and_precision_validated
+
+hypotheses:
+  - id: H1
+    description: Différence de réponse pupillaire tardive entre conditions A et B.
+    role: primary
+    window: stimulus_late
+    metric: pupil_baseline_corrected
+    observation_unit: trial
+    model:
+      kind: subject_fixed_effects_clustered_ols
+      formula: value ~ C(condition) + C(run_id) + C(participant_id)
+      cluster: participant_id
+      group_levels: [A, B]
+      contrast: B_minus_A
+      require_within_subject_condition_variation: true
+      recount_after_all_missingness_filters: true
+    multiplicity_family: primary_pupil
+
+outputs:
+  retain_excluded_windows_with_reasons: true
+  per_metric_units_and_requirements: true
+  recording_and_event_provenance: true
+  code_and_input_hashes: true
+  html_qc_report: true
+  bids_export_version: 1.11.2

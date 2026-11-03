@@ -24,6 +24,10 @@ def run_clustered_models(metrics_long: pd.DataFrame, cfg: Config) -> pd.DataFram
             data = valid.loc[(valid['moment'] == spec['moment']) & valid['metric'].isin(spec['metrics'])]
             for metric, d in data.groupby('metric'):
                 d = d.dropna(subset=['value', 'subject_id', group, 'run_id']).copy()
+                if spec['rating_model']:
+                    d = d.dropna(subset=['LTask_rating']).copy()
+                numeric = ['value'] + (['LTask_rating'] if spec['rating_model'] else [])
+                d = d.loc[np.isfinite(d[numeric].to_numpy(dtype=float)).all(axis=1)].copy()
                 row = dict(hypothesis=name, moment=spec['moment'], metric=metric,
                            scheme=scheme, group_column=group, n_rows=len(d),
                            n_subjects=d['subject_id'].nunique(), p_group_raw=np.nan,
@@ -42,7 +46,7 @@ def run_clustered_models(metrics_long: pd.DataFrame, cfg: Config) -> pd.DataFram
                 rhs = f'C({group}) + C(run_id) + C(subject_id)'
                 if spec['rating_model']:
                     d = d.dropna(subset=['LTask_rating'])
-                    if d['LTask_rating'].std() < 1e-10:
+                    if not np.isfinite(d['LTask_rating'].std()) or d['LTask_rating'].std() < 1e-10:
                         row['error'] = 'invalid_rating'; rows.append(row); continue
                     d['rating_z'] = (d['LTask_rating']-d['LTask_rating'].mean())/d['LTask_rating'].std()
                     rhs += ' + rating_z'
@@ -53,7 +57,10 @@ def run_clustered_models(metrics_long: pd.DataFrame, cfg: Config) -> pd.DataFram
                     rhs += ' + rt_log'
                 row['formula'] = 'value_z ~ ' + rhs
                 try:
-                    fit = smf.ols(row['formula'], data=d).fit(
+                    model = smf.ols(row['formula'], data=d, missing='raise')
+                    if np.linalg.matrix_rank(model.exog) < model.exog.shape[1]:
+                        row['error'] = 'rank_deficient_design'; rows.append(row); continue
+                    fit = model.fit(
                         cov_type='cluster', cov_kwds={'groups':d['subject_id'],
                                                      'use_correction':True}, use_t=True)
                     terms = [x for x in fit.params.index if x.startswith(f'C({group})')]
@@ -62,7 +69,7 @@ def run_clustered_models(metrics_long: pd.DataFrame, cfg: Config) -> pd.DataFram
                     hyp = ' = 0, '.join(terms) + ' = 0'
                     row['p_group_raw'] = float(fit.f_test(hyp).pvalue)
                     row['converged'] = True
-                    row['model_reliable'] = True
+                    row['model_reliable'] = np.isfinite(row['p_group_raw'])
                     row['group_effect_std'] = float(fit.params[terms].loc[fit.params[terms].abs().idxmax()])
                     row['max_abs_group_beta_z'] = float(fit.params[terms].abs().max())
                     if spec['rating_model'] and 'rating_z' in fit.pvalues:

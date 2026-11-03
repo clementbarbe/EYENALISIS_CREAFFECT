@@ -114,7 +114,7 @@ def process_run(
             run_id,
         )
 
-        samples, events = parse_asc(asc_path)
+        samples, events = parse_asc(asc_path, eye=cfg.eye)
 
         sync = synchronize_run(
             events,
@@ -270,6 +270,8 @@ def main(
     (output_dirs["root"] / "dependency_versions.json").write_text(
         json.dumps(versions, indent=2), encoding='utf-8')
     subjects = discover_subjects(data_root)
+    if not subjects:
+        raise ValueError(f"Aucun dossier participant C4X### dans {data_root}")
 
     print(f"[1/5] Sujets détectés : {len(subjects)}")
     print(f"      Output : {output_dirs['root']}")
@@ -311,7 +313,7 @@ def main(
                 matched_asc,
                 output_root=output_dirs["root"],
                 collect_timecourses=not no_timecourses,
-                make_qc_plot=qc_plots,
+                make_qc_plot=qc_plots and not no_figures,
             )
 
             run_qc_rows.append(qc)
@@ -427,6 +429,10 @@ def main(
         pupil_timecourses = pd.concat(all_timecourses,ignore_index=True)
         pupil_timecourses = pupil_timecourses.loc[pupil_timecourses['subject_id'].isin(kept_subjects)]
         pupil_timecourses.to_csv(output_dirs["tables"] / "event_locked_pupil_timecourses_20hz.csv",index=False)
+    if not no_figures:
+        plot_exclusion_funnel(run_qc, subject_qc, output_dirs["figures_exclusion"], cfg)
+        plot_run_exclusion_reasons(run_exclusion_summary, output_dirs["figures_exclusion"], cfg)
+        plot_gaze_heatmaps(gaze_samples, output_dirs["figures_gaze"], cfg)
     print("[5/5] Modèles exploratoires (non pré-enregistrés)...")
     if no_stats:
         print("Analyses statistiques désactivées (--no-stats).")
@@ -446,19 +452,6 @@ def main(
         return
 
     print("[5/5] Création des figures...")
-
-    plot_exclusion_funnel(
-        run_qc,
-        subject_qc,
-        output_dirs["figures_exclusion"],
-        cfg,
-    )
-
-    plot_run_exclusion_reasons(
-        run_exclusion_summary,
-        output_dirs["figures_exclusion"],
-        cfg,
-    )
 
     plot_results_table(
         stats_df,
@@ -480,26 +473,25 @@ def main(
         cfg,
     )
 
-    plot_gaze_heatmaps(
-        gaze_samples,
-        output_dirs["figures_gaze"],
-        cfg,
-    )
-
     print("Pipeline terminé.")
     print(f"Résultats : {output_dirs['root']}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Pipeline exploratoire pupillométrie CREAFFECT en IRMf."
+        description="Eye-tracking exploratoire : profil CREAFFECT ou projet déclaratif."
     )
 
     parser.add_argument(
         "data_root",
+        nargs="?",
         type=Path,
         help="Dossier Data contenant les dossiers C4X###.",
     )
+
+    parser.add_argument("--project", "--config", dest="project", type=Path,
+                        help="Projet générique version 1 (.json/.yaml), avec manifest et événements")
+    parser.add_argument("--list-metrics", action="store_true", help="Afficher le catalogue de métriques")
 
     parser.add_argument(
         "--output-dir",
@@ -507,7 +499,7 @@ if __name__ == "__main__":
         default=None,
         help=(
             "Dossier de sortie. "
-            "Par défaut : <data_root>/output"
+            "Par défaut : <data_root>/output, ou <dossier_projet>/results"
         ),
     )
 
@@ -518,10 +510,26 @@ if __name__ == "__main__":
     parser.add_argument("--mixedlm",action="store_true",
                         help="Lancer en complément les anciens modèles mixtes (coûteux)")
     parser.add_argument("--no-stats", action="store_true",
-                        help="Calcul QC/métriques uniquement, sans modèles ni figures")
+                        help="Calcul QC/métriques et descriptifs, sans modèles statistiques")
     parser.add_argument("--no-figures", action="store_true",
                         help="Conserver les modèles et tableaux, sans graphiques")
     args = parser.parse_args()
+
+    if args.list_metrics:
+        from metrics import metric_catalog
+        print(metric_catalog().to_csv(index=False))
+        raise SystemExit(0)
+    if args.project is not None:
+        if args.data_root is not None or args.mixedlm:
+            parser.error("--project ne se combine pas avec data_root ou --mixedlm")
+        from project_pipeline import run_project
+        result = run_project(args.project, args.output_dir, no_stats=args.no_stats,
+                             no_timecourses=args.no_timecourses,
+                             qc_plots=args.qc_plots and not args.no_figures)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        raise SystemExit(2 if result["errors"] else 0)
+    if args.data_root is None:
+        parser.error("Indiquer data_root (CREAFFECT) ou --project (projet générique)")
 
     data_root = args.data_root.resolve()
 
