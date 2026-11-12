@@ -302,6 +302,15 @@ Options applicables : `--no-stats`, `--no-timecourses`, `--qc-plots`,
 `--no-figures`. Le rapport tabulaire HTML reste produit. `--config` est un alias
 de `--project`. `--mixedlm` reste réservé au lancement historique CREAFFECT.
 
+`--preprocessing-only` arrête le mode projet avant la lecture des événements
+et des ancres d'horloge : seuls les ASC sont prétraités. Il exporte
+`preprocessing_report.html` et les tableaux de durées, avec synchronisation et
+exclusions globales déclarées non évaluées. Le manifest peut alors omettre les
+chemins d'événements. Les fichiers de projet et manifest restent validés.
+Le [guide M2](PRETRAITEMENT_GUIDE_M2.md) explique les durées, les étapes et les
+différents niveaux d'exclusion. Le bilan de prétraitement est aussi généré lors
+d'une exécution complète.
+
 ## Changements scientifiques apportés au chemin CREAFFECT
 
 Les corrections partagées modifient volontairement certains résultats :

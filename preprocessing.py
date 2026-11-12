@@ -163,6 +163,7 @@ def preprocess_pupil(samples: pd.DataFrame, events: pd.DataFrame,
     artifact |= outliers
     interp, interpolated = _interpolate_short_gaps(pd.Series(clean_input), t,
                                                    cfg.interpolation_max_gap_ms, segment_ids)
+    df['pupil_before_filter'] = interp
     df['pupil_clean'] = _filter_valid_segments(interp, t, cfg, segment_ids)
     df['pupil_missing_acquisition'] = acquisition_missing
     df['pupil_artifact_mask'] = artifact

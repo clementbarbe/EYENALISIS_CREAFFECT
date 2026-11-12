@@ -19,7 +19,8 @@ from parsing_eyetracking import parse_asc
 from preprocessing import preprocess_pupil
 from project_config import load_project
 from project_models import run_project_models
-from qc_plots import plot_run_qc
+from qc_plots import plot_run_qc, plot_preprocessing_steps
+from preprocessing_summary import summarize_recording, export_preprocessing_report
 from timecourse import make_timecourses
 
 
@@ -31,9 +32,9 @@ def _hash(path):
     return digest.hexdigest()
 
 
-def _read_manifest(path):
+def _read_manifest(path, *, require_events=True):
     manifest = read_table(path)
-    required = {"participant_id", "run_id", "asc_path", "events_path"}
+    required = {"participant_id", "run_id", "asc_path"} | ({"events_path"} if require_events else set())
     if manifest.empty or not required.issubset(manifest):
         raise ValueError("Manifest requires participant_id, run_id, asc_path, events_path and at least one row")
     if "session_id" not in manifest:
@@ -43,7 +44,7 @@ def _read_manifest(path):
             raise ValueError(f"Empty manifest {key}")
     if manifest.duplicated(["participant_id", "session_id", "run_id"]).any():
         raise ValueError("Duplicate participant/session/run in manifest")
-    for field in ("asc_path", "events_path"):
+    for field in (["asc_path", "events_path"] if require_events else ["asc_path"]):
         for value in manifest[field]:
             if not (path.parent / value).is_file():
                 raise FileNotFoundError(f"Missing {field}: {path.parent / value}")
@@ -88,6 +89,7 @@ def _write_report(root, project, recording_qc, metrics, models, figures):
                 "<p>Rapport exploratoire. Les exclusions et prérequis sont conservés dans les tableaux. "
                 "La configuration de prétraitement doit être validée pour chaque protocole.</p>",
                 "<h2>Acquisitions</h2>", recording_qc.to_html(index=False, escape=True),
+                "<p><a href='preprocessing_report.html'>Ouvrir le bilan pédagogique des durées et du prétraitement</a></p>",
                 "<h2>Fenêtres et métriques</h2>", summary.to_html(escape=True)]
     if not models.empty:
         contents.extend(["<h2>Contrastes déclarés</h2>", models.to_html(index=False, escape=True)])
@@ -98,11 +100,12 @@ def _write_report(root, project, recording_qc, metrics, models, figures):
     (root / "report.html").write_text("\n".join(contents), encoding="utf-8")
 
 
-def run_project(project_path, output_root=None, *, no_stats=False, no_timecourses=False, qc_plots=False):
+def run_project(project_path, output_root=None, *, no_stats=False, no_timecourses=False, qc_plots=False,
+                preprocessing_only=False, figures=True):
     project_path = Path(project_path).resolve()
     project, cfg = load_project(project_path)
     manifest_path = (project_path.parent / project["recordings_manifest"]).resolve()
-    manifest = _read_manifest(manifest_path)
+    manifest = _read_manifest(manifest_path, require_events=not preprocessing_only)
     root = Path(output_root).resolve() if output_root is not None else project_path.parent / "results"
     if root.exists() and any(root.iterdir()):
         raise ValueError(f"Output directory is not empty; choose a new directory: {root}")
@@ -119,27 +122,43 @@ def run_project(project_path, output_root=None, *, no_stats=False, no_timecourse
                       dependency_versions=versions,
                       code_sha256={p.name: _hash(p) for p in sorted(Path(__file__).parent.glob("*.py"))},
                       recordings=[])
-    (root / "config_used.json").write_text(json.dumps({"project": project, "defaults": asdict(cfg)},
+    (root / "config_used.json").write_text(json.dumps({"project": project, "defaults": asdict(cfg),
+                                                    "pipeline_stage": "preprocessing" if preprocessing_only else "full"},
                                                     indent=2, ensure_ascii=False), encoding="utf-8")
     manifest.to_csv(root / "tables" / "recordings_manifest.csv", index=False)
     metric_catalog().to_csv(root / "tables" / "metric_catalog.csv", index=False)
-    all_windows, all_metrics, all_timecourses, qc_rows, figures = [], [], [], [], []
+    all_windows, all_metrics, all_timecourses, qc_rows, figure_names = [], [], [], [], []
     for index, recording in enumerate(manifest.to_dict("records"), start=1):
         print(f"[{index}/{len(manifest)}] {recording['participant_id']} / {recording['session_id']} / {recording['run_id']}", flush=True)
         qc = {key: recording[key] for key in ("participant_id", "session_id", "run_id")}
-        qc.update(recording_processed=False, error="")
+        qc.update(recording_processed=False, error="", preprocessing_completed=False, recording_span_s=np.nan)
         record_provenance = {**qc}
         try:
             asc_path = (manifest_path.parent / recording["asc_path"]).resolve()
-            event_path = (manifest_path.parent / recording["events_path"]).resolve()
             samples, ocular = parse_asc(asc_path, eye=recording.get("eye") or cfg.eye, strict=True)
             local_cfg = _recording_config(cfg, project.get("parameters", {}), recording, samples)
+            cleaned, blinks = preprocess_pupil(samples, ocular, local_cfg)
+            qc.update(summarize_recording(cleaned, local_cfg, ocular))
+            metadata = samples.attrs["eyelink_metadata"]
+            record_provenance.update(asc=str(asc_path), asc_metadata=metadata, parameters=asdict(local_cfg))
+            example = root / 'figures' / 'preprocessing' / 'preprocessing_steps_example.png'
+            if figures and not example.exists():
+                plot_preprocessing_steps(cleaned, local_cfg, example)
+            if preprocessing_only:
+                if qc_plots and figures:
+                    name = f"recording-{index:04}"
+                    plot_run_qc(cleaned, name, root / 'figures')
+                    figure_names.append(f"{name}_pupil_QC.png")
+                qc.update(recording_processed=True, clock_quality='not_evaluated_preprocessing_only')
+                record_provenance.update(recording_processed=True, preprocessing_completed=True)
+                provenance['recordings'].append(record_provenance)
+                qc_rows.append(qc)
+                continue
+            event_path = (manifest_path.parent / recording["events_path"]).resolve()
             clock = fit_clock(recording, project["synchronization"], manifest_path.parent)
             task = read_task_events(event_path, project.get("events", {}), recording)
             windows = build_project_windows(task, project, recording, clock, local_cfg)
-            cleaned, blinks = preprocess_pupil(samples, ocular, local_cfg)
             metrics = extract_metrics(windows, cleaned, blinks, ocular, local_cfg)
-            metadata = samples.attrs["eyelink_metadata"]
             for frame in (windows, metrics):
                 frame["recorded_eye"] = metadata["selected_eye"]
                 frame["sampling_rate_hz"] = local_cfg.sampling_rate_hz
@@ -157,10 +176,10 @@ def run_project(project_path, output_root=None, *, no_stats=False, no_timecourse
                 width = project.get("timecourses", {}).get("bin_width_s", 0.05)
                 timecourses = make_timecourses(selected, cleaned, local_cfg,
                                                target_hz=1.0 / width, moments=selected.moment.unique())
-            if qc_plots:
+            if qc_plots and figures:
                 name = f"recording-{index:04}"
                 plot_run_qc(cleaned, name, root / "figures")
-                figures.append(f"{name}_pupil_QC.png")
+                figure_names.append(f"{name}_pupil_QC.png")
             qc.update(recording_processed=True, n_windows=len(windows), n_metric_rows=len(metrics),
                       n_valid_metric_rows=int(metrics.moment_valid.sum()),
                       observed_pupil_fraction=float(cleaned.pupil_observed_valid.mean()),
@@ -190,7 +209,8 @@ def run_project(project_path, output_root=None, *, no_stats=False, no_timecourse
     metrics = pd.concat(all_metrics, ignore_index=True) if all_metrics else pd.DataFrame()
     courses = pd.concat(all_timecourses, ignore_index=True) if all_timecourses else pd.DataFrame()
     recording_qc = pd.DataFrame(qc_rows)
-    models = run_project_models(metrics, project.get("hypotheses", []), cfg) if not no_stats else pd.DataFrame()
+    export_preprocessing_report(recording_qc, root, asdict(cfg), profile='project', figures=figures)
+    models = run_project_models(metrics, project.get("hypotheses", []), cfg) if not no_stats and not preprocessing_only else pd.DataFrame()
     for filename, frame in (("windows.csv", windows.drop(columns="metrics", errors="ignore")),
                             ("metrics_long.csv", metrics), ("recording_qc.csv", recording_qc),
                             ("timecourses.csv", courses), ("hypothesis_models.csv", models)):
@@ -207,7 +227,7 @@ def run_project(project_path, output_root=None, *, no_stats=False, no_timecourse
         metrics.loc[metrics.moment_valid].groupby(dims, dropna=False).value.agg(
             ["count", "mean", "std"]).to_csv(root / "tables" / "descriptives.csv")
     (root / "provenance.json").write_text(json.dumps(provenance, indent=2, ensure_ascii=False), encoding="utf-8")
-    _write_report(root, project, recording_qc, metrics, models, figures)
+    _write_report(root, project, recording_qc, metrics, models, figure_names)
     return dict(output_dir=str(root), recordings=len(manifest),
                 processed=int(recording_qc.recording_processed.sum()),
                 errors=int((~recording_qc.recording_processed).sum()),

@@ -34,6 +34,8 @@ from moments import build_moment_windows
 from parsing_behavior import parse_behavior_csv
 from parsing_eyetracking import parse_asc
 from preprocessing import preprocess_pupil
+from preprocessing_summary import summarize_recording, export_preprocessing_report
+from qc_plots import plot_preprocessing_steps
 from stats import run_confirmatory_models
 from sync import synchronize_run
 from viz import (
@@ -74,6 +76,8 @@ def process_run(
     output_root: Path | None = None,
     collect_timecourses: bool = True,
     make_qc_plot: bool = False,
+    preprocessing_only: bool = False,
+    make_preprocessing_example: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
     """Traite un run complet sans interrompre le pipeline."""
     csv_path, asc_path = find_run_files(
@@ -97,44 +101,31 @@ def process_run(
         "sync_end_difference_s": np.nan,
         "n_detected_blinks": np.nan,
         "mean_blink_duration_ms": np.nan,
+        "preprocessing_completed": False,
+        "recording_span_s": np.nan,
+        "run_qc_passed": False,
     }
-
-    if csv_path is None:
-        qc["run_exclusion_reason"] = "missing_behavior_csv"
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), qc
 
     if asc_path is None:
         qc["run_exclusion_reason"] = "missing_asc"
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), qc
 
     try:
-        trials, timing = parse_behavior_csv(
-            csv_path,
-            subject_id,
-            run_id,
-        )
-
         samples, events = parse_asc(asc_path, eye=cfg.eye)
-
-        sync = synchronize_run(
-            events,
-            timing,
-            samples,
-            cfg,
-            expected_run_id=run_id,
-        )
-
-        qc["sync_n_triggers"] = sync.n_triggers
-        qc["sync_trigger_interval_median_s"] = sync.median_trigger_interval_s
-        qc["sync_trigger_interval_cv"] = sync.trigger_interval_cv
-        qc["sync_quality_flag"] = sync.quality_flag
-        qc["sync_end_difference_s"] = sync.end_difference_s
 
         preprocessed, blink_intervals = preprocess_pupil(
             samples,
             events,
             cfg,
         )
+        qc.update(summarize_recording(preprocessed, cfg, events))
+        if preprocessed.empty:
+            qc['run_exclusion_reason'] = 'empty_samples'
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), qc
+        if make_preprocessing_example and output_root is not None and not preprocessed.empty:
+            example = output_root / 'figures' / 'preprocessing' / 'preprocessing_steps_example.png'
+            if not example.exists():
+                plot_preprocessing_steps(preprocessed, cfg, example)
 
         qc["n_detected_blinks"] = len(blink_intervals)
 
@@ -155,6 +146,17 @@ def process_run(
         qc['run_gaze_valid_fraction'] = float(preprocessed['gaze_valid'].mean())
         if make_qc_plot and output_root is not None:
             plot_run_qc(preprocessed, f'C4X{subject_id}_run{run_id}', output_root / 'figures' / 'qc_traces')
+        if csv_path is None:
+            qc['run_exclusion_reason'] = 'missing_behavior_csv'
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), qc
+        trials, timing = parse_behavior_csv(csv_path, subject_id, run_id)
+        sync = synchronize_run(events, timing, samples, cfg, expected_run_id=run_id)
+        qc['sync_n_triggers'] = sync.n_triggers
+        qc['sync_trigger_interval_median_s'] = sync.median_trigger_interval_s
+        qc['sync_trigger_interval_cv'] = sync.trigger_interval_cv
+        qc['sync_quality_flag'] = sync.quality_flag
+        qc['sync_end_difference_s'] = sync.end_difference_s
+        qc['scanner_anchored_duration_s'] = float(timing.get('t_run_end', np.nan)) - float(timing.get('t0_fMRI', np.nan))
         qc.update(
             evaluate_run_exclusion(
                 preprocessed,
@@ -162,8 +164,9 @@ def process_run(
                 cfg,
             )
         )
+        qc['run_qc_passed'] = qc['run_valid']
 
-        if not qc["run_valid"]:
+        if not qc["run_valid"] or preprocessing_only:
             return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), qc
 
         windows = build_moment_windows(
@@ -251,14 +254,18 @@ def main(
     no_timecourses: bool = False,
     qc_plots: bool = False,
     run_mixedlm: bool = False,
+    preprocessing_only: bool = False,
 ) -> None:
     """Exécute le pipeline complet."""
     cfg = DEFAULT_CONFIG
+    if preprocessing_only and output_root.exists() and any(output_root.iterdir()):
+        raise ValueError(f"Le dossier de sortie n'est pas vide ; choisir un nouveau dossier : {output_root}")
     output_dirs = make_output_dirs(output_root)
 
     (output_dirs["root"] / "config_used.json").write_text(
         json.dumps({"generated_utc":datetime.now(timezone.utc).isoformat(),
-                    "config":asdict(cfg), "analysis_type":"exploratory"},
+                    "config":asdict(cfg), "analysis_type":"exploratory",
+                    "pipeline_stage":"preprocessing" if preprocessing_only else "full"},
                    indent=2, ensure_ascii=False), encoding="utf-8")
     deps = ['numpy', 'pandas', 'scipy', 'statsmodels', 'matplotlib', 'seaborn']
     versions = {}
@@ -314,6 +321,8 @@ def main(
                 output_root=output_dirs["root"],
                 collect_timecourses=not no_timecourses,
                 make_qc_plot=qc_plots and not no_figures,
+                preprocessing_only=preprocessing_only,
+                make_preprocessing_example=not no_figures,
             )
 
             run_qc_rows.append(qc)
@@ -381,6 +390,13 @@ def main(
         f"[3/5] Sujets retenus : "
         f"{len(kept_subjects)}/{len(subject_qc)}"
     )
+
+    export_preprocessing_report(run_qc, output_dirs['root'], asdict(cfg),
+                                profile='creaffect', subject_qc=subject_qc, figures=not no_figures)
+    print(f"Bilan de prétraitement : {output_dirs['root'] / 'preprocessing_report.html'}")
+    if preprocessing_only:
+        print('Arrêt après prétraitement et QC ; aucune métrique événementielle calculée.')
+        return
 
     if not all_metrics:
         print("[STOP] Aucune métrique exploitable.")
@@ -492,6 +508,8 @@ if __name__ == "__main__":
     parser.add_argument("--project", "--config", dest="project", type=Path,
                         help="Projet générique version 1 (.json/.yaml), avec manifest et événements")
     parser.add_argument("--list-metrics", action="store_true", help="Afficher le catalogue de métriques")
+    parser.add_argument("--preprocessing-only", action="store_true",
+                        help="Prétraitement, durées et QC de cohorte, sans métriques événementielles ni modèles")
 
     parser.add_argument(
         "--output-dir",
@@ -525,7 +543,8 @@ if __name__ == "__main__":
         from project_pipeline import run_project
         result = run_project(args.project, args.output_dir, no_stats=args.no_stats,
                              no_timecourses=args.no_timecourses,
-                             qc_plots=args.qc_plots and not args.no_figures)
+                             qc_plots=args.qc_plots and not args.no_figures,
+                             preprocessing_only=args.preprocessing_only, figures=not args.no_figures)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         raise SystemExit(2 if result["errors"] else 0)
     if args.data_root is None:
@@ -546,4 +565,4 @@ if __name__ == "__main__":
 
     main(data_root, output_root, no_stats=args.no_stats,
          no_figures=args.no_figures, no_timecourses=args.no_timecourses,
-         qc_plots=args.qc_plots, run_mixedlm=args.mixedlm)
+         qc_plots=args.qc_plots, run_mixedlm=args.mixedlm, preprocessing_only=args.preprocessing_only)

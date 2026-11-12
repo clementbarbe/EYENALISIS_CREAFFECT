@@ -1,5 +1,20 @@
 # Mode projet version 1 — 3 novembre 2026
 
+## Bilan du prétraitement — 12 novembre 2026
+
+- Nouveau `--preprocessing-only` pour arrêter après le nettoyage/QC, sans
+  extraction événementielle ni modèle ; disponible pour CREAFFECT et les projets.
+- Bilan par run, participant, numéro de run et cohorte, avec durées totales,
+  acquises, observées, interpolées, inutilisables et trous d'acquisition.
+  Les durées inconnues restent manquantes, les runs exclus restent présents.
+- Rapport HTML et figures de présentation, dont un même extrait à quatre
+  étapes. Paramètres et critères exportés avec leur statut méthodologique.
+- Script `summarize_preprocessing.py` pour refaire ce bilan à partir des sorties.
+- Guide M2 pour expliquer les étapes et les exclusions avec références.
+- Les algorithmes et seuils de nettoyage restent ceux du mode projet version 1.
+
+## Première version
+
 Première implémentation issue de l'audit scientifique et technique.
 
 - Nouveau lancement `run_pipeline.py --project projet.json` ou `.yaml`,

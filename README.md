@@ -2,6 +2,34 @@
 
 **Statut :** pipeline exploratoire, auditable et reproductible. Il ne s'agit **pas** d'un protocole universellement validé ni d'une analyse confirmatoire pré-enregistrée. Les seuils QC proposés sont des points de départ à examiner **sans regarder les effets des conditions**.
 
+Pour découvrir la première partie avec une stagiaire, commencer par le
+[guide du prétraitement pour M2](docs/PRETRAITEMENT_GUIDE_M2.md). Le bilan des
+durées run par run et de la cohorte se génère dès le prétraitement :
+
+```bash
+python run_pipeline.py data --preprocessing-only \
+  --output-dir output/bilan_preprocessing_2026-11-12
+```
+
+Ouvrir `preprocessing_report.html` dans ce dossier : étapes, paramètres,
+références, exclusions, durées observées/interpolées et figures. Les tableaux
+`tables/preprocessing_*.csv` conservent tous les runs, y compris absents et exclus.
+Le même bilan est aussi produit lors d'un lancement complet. Pour le reconstruire
+sans relire les ASC :
+
+```bash
+python summarize_preprocessing.py output/bilan_preprocessing_2026-11-12 \
+  --output-dir output/presentation_preprocessing
+```
+
+Installer les dépendances ci-dessous et choisir un nouveau dossier de sortie
+pour chaque lancement de traitement. Les durées concernent tout l'ASC, et non
+la somme de fenêtres d'analyse éventuellement chevauchantes.
+
+Les [chiffres de la cohorte recalculés le 12 novembre 2026](docs/BILAN_PREPROCESSING_COHORTE_2026-11-12.md)
+fournissent un support de présentation : 206 ASC mesurés sur 260 runs attendus,
+avec un point d'attention sur l'absence d'ASC appariable au run 3.
+
 Le [mode projet version 1](docs/MODE_PROJET.md) permet maintenant de déclarer les acquisitions, événements, fenêtres, baselines, métriques et contrastes dans un fichier JSON ou YAML, sans conventions C4X/FGAT. Le [projet d'exemple exécutable](examples/project_example.json) et son [générateur de données synthétiques](examples/generate_demo.py) permettent de l'essayer :
 
 ```bash
